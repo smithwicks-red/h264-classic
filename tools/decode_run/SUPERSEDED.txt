@@ -1,0 +1,8 @@
+tools/decode_run is the v13 harness. It cuts fragments out of H264Codec.c
+by searching for marker lines, and the v14 reorganisation of that file
+breaks the search on purpose: since v14 the harness is tools/host, which
+compiles the whole file. Kept for extract_samples.py (still used by
+tools/host/run_all.sh), compare_ff.py and check_dst.py, and to rebuild
+v13 from the 2026-09-24 tarball for comparisons. tools/ctx is likewise a
+v13-only type check. drop_sim.py's schedules still work with
+tools/host/decode_run --mode list:FILE.

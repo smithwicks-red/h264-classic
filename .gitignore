@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+host_work/
+*.o
+.DS_Store

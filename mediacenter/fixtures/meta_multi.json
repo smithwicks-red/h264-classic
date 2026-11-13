@@ -1,0 +1,17 @@
+{"d1":"ia600101.ca.archive.org","d2":"ia800101.us.archive.org","dir":"/12/items/multi_item","is_dark":false,
+"files":[
+{"name":"a.ia.mp4","format":"h.264 IA","size":"100"},
+{"name":"b.mp4","format":"h.264","size":"200"},
+{"name":"c.mp4","format":"MPEG4","size":"300"},
+{"name":"My Film (1950) #1.mp4","format":"512Kb MPEG4","size":"5000000000"},
+{"name":"e_512kb.mp4","format":"512Kb MPEG4","size":400},
+{"name":"f.mkv","format":"MPEG4","size":"1"},
+{"name":"g.mp4","format":"h.264 HD","size":"700"},
+{"name":"h.mp4","format":"MPEG4","size":"800"},
+{"name":"i.mp4","format":"MPEG4","size":"900"},
+{"name":"j.mp4","format":"MPEG4","size":"1000"},
+{"name":"k.mp4","format":"MPEG4","size":"1100"},
+{"name":"l.mp4","format":"MPEG4","size":"1200"}
+],
+"metadata":{"title":["Array Title","Second"]},
+"server":"ia600101.ca.archive.org","workable_servers":["ia600101.ca.archive.org","ia800101.us.archive.org","ia900101.us.archive.org"]}

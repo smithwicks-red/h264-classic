@@ -1,0 +1,9 @@
+{"responseHeader":{"status":0,"params":{"rows":25}},
+ "response" : { "numFound" : 1234 , "start":0, "docs" : [
+  {"identifier":"arr_title","title":["First Title","Second Title"]},
+  {"identifier":"uni_title","title":"Café “Noir” 🎬 日 A\/B \\ \"q\"\tz"},
+  {"title":"no identifier, must be skipped"},
+  {"identifier":"no_title"},
+  {"identifier":"nested","extra":{"a":[1,2,{"b":null}],"c":true},"title":"Nested OK","n":-1.5e3},
+  {"identifier":"empty_arr","title":[]}
+ ]}}
