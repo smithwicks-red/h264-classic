@@ -1,0 +1,190 @@
+diff -ruN ffmpeg-old/libavcodec/dsputil.c s3/ff/libavcodec/dsputil.c
+--- ffmpeg-old/libavcodec/dsputil.c	2026-11-14 09:01:37.712956227 +0000
++++ s3/ff/libavcodec/dsputil.c	2026-11-14 20:27:33.434418722 +0000
+@@ -42,13 +42,17 @@
+ uint8_t ff_cropTbl[256 + 2 * MAX_NEG_CROP] = {0, };
+ uint32_t ff_squareTbl[512] = {0, };
+ 
++#if !AVD_8BIT_ONLY /* AVCDecLib: 8-bit only build drops 9/10-bit templates */
+ #define BIT_DEPTH 9
+ #include "dsputil_template.c"
+ #undef BIT_DEPTH
++#endif
+ 
++#if !AVD_8BIT_ONLY /* AVCDecLib: 8-bit only build drops 9/10-bit templates */
+ #define BIT_DEPTH 10
+ #include "dsputil_template.c"
+ #undef BIT_DEPTH
++#endif
+ 
+ #define BIT_DEPTH 8
+ #include "dsputil_template.c"
+@@ -2865,6 +2869,7 @@
+                 c->idct_add= ff_h264_lowres_idct_add_8_c;
+             } else {
+                 switch (avctx->bits_per_raw_sample) {
++#if !AVD_8BIT_ONLY
+                     case 9:
+                         c->idct_put= ff_h264_lowres_idct_put_9_c;
+                         c->idct_add= ff_h264_lowres_idct_add_9_c;
+@@ -2872,6 +2877,7 @@
+                     case 10:
+                         c->idct_put= ff_h264_lowres_idct_put_10_c;
+                         c->idct_add= ff_h264_lowres_idct_add_10_c;
++#endif
+                         break;
+                     default:
+                         c->idct_put= ff_h264_lowres_idct_put_8_c;
+@@ -3198,12 +3204,14 @@
+         BIT_DEPTH_FUNCS(8)
+     } else {
+         switch (avctx->bits_per_raw_sample) {
++#if !AVD_8BIT_ONLY
+             case 9:
+                 BIT_DEPTH_FUNCS(9)
+                 break;
+             case 10:
+                 BIT_DEPTH_FUNCS(10)
+                 break;
++#endif
+             default:
+                 av_log(avctx, AV_LOG_DEBUG, "Unsupported bit depth: %d\n", avctx->bits_per_raw_sample);
+                 BIT_DEPTH_FUNCS(8)
+diff -ruN ffmpeg-old/libavcodec/h264.c s3/ff/libavcodec/h264.c
+--- ffmpeg-old/libavcodec/h264.c	2026-11-14 09:01:37.716378082 +0000
++++ s3/ff/libavcodec/h264.c	2026-11-14 20:27:03.301386115 +0000
+@@ -3887,7 +3887,11 @@
+             }
+ 
+             if (avctx->bits_per_raw_sample != h->sps.bit_depth_luma) {
++#if AVD_8BIT_ONLY /* AVCDecLib: 9/10-bit code is not built */
++                if (h->sps.bit_depth_luma == 8) {
++#else
+                 if (h->sps.bit_depth_luma >= 8 && h->sps.bit_depth_luma <= 10) {
++#endif
+                     avctx->bits_per_raw_sample = h->sps.bit_depth_luma;
+                     h->pixel_shift = h->sps.bit_depth_luma > 8;
+ 
+diff -ruN ffmpeg-old/libavcodec/h264dsp.c s3/ff/libavcodec/h264dsp.c
+--- ffmpeg-old/libavcodec/h264dsp.c	2026-11-14 09:01:37.720378082 +0000
++++ s3/ff/libavcodec/h264dsp.c	2026-11-14 20:26:45.856030763 +0000
+@@ -33,13 +33,17 @@
+ #include "h264dsp_template.c"
+ #undef BIT_DEPTH
+ 
++#if !AVD_8BIT_ONLY /* AVCDecLib: 8-bit only build drops 9/10-bit templates */
+ #define BIT_DEPTH 9
+ #include "h264dsp_template.c"
+ #undef BIT_DEPTH
++#endif
+ 
++#if !AVD_8BIT_ONLY /* AVCDecLib: 8-bit only build drops 9/10-bit templates */
+ #define BIT_DEPTH 10
+ #include "h264dsp_template.c"
+ #undef BIT_DEPTH
++#endif
+ 
+ void ff_h264dsp_init(H264DSPContext *c, const int bit_depth)
+ {
+@@ -94,12 +98,14 @@
+     c->h264_loop_filter_strength= NULL;
+ 
+     switch (bit_depth) {
++#if !AVD_8BIT_ONLY
+     case 9:
+         H264_DSP(9);
+         break;
+     case 10:
+         H264_DSP(10);
+         break;
++#endif
+     default:
+         H264_DSP(8);
+         break;
+diff -ruN ffmpeg-old/libavcodec/h264idct.c s3/ff/libavcodec/h264idct.c
+--- ffmpeg-old/libavcodec/h264idct.c	2026-11-14 09:01:37.720378082 +0000
++++ s3/ff/libavcodec/h264idct.c	2026-11-14 20:26:45.854793758 +0000
+@@ -29,10 +29,14 @@
+ #include "h264idct_template.c"
+ #undef BIT_DEPTH
+ 
++#if !AVD_8BIT_ONLY /* AVCDecLib: 8-bit only build drops 9/10-bit templates */
+ #define BIT_DEPTH 9
+ #include "h264idct_template.c"
+ #undef BIT_DEPTH
++#endif
+ 
++#if !AVD_8BIT_ONLY /* AVCDecLib: 8-bit only build drops 9/10-bit templates */
+ #define BIT_DEPTH 10
+ #include "h264idct_template.c"
+ #undef BIT_DEPTH
++#endif
+diff -ruN ffmpeg-old/libavcodec/h264pred.c s3/ff/libavcodec/h264pred.c
+--- ffmpeg-old/libavcodec/h264pred.c	2026-11-14 09:01:37.720378082 +0000
++++ s3/ff/libavcodec/h264pred.c	2026-11-14 20:26:45.856585025 +0000
+@@ -31,13 +31,17 @@
+ #include "h264pred_template.c"
+ #undef BIT_DEPTH
+ 
++#if !AVD_8BIT_ONLY /* AVCDecLib: 8-bit only build drops 9/10-bit templates */
+ #define BIT_DEPTH 9
+ #include "h264pred_template.c"
+ #undef BIT_DEPTH
++#endif
+ 
++#if !AVD_8BIT_ONLY /* AVCDecLib: 8-bit only build drops 9/10-bit templates */
+ #define BIT_DEPTH 10
+ #include "h264pred_template.c"
+ #undef BIT_DEPTH
++#endif
+ 
+ static void pred4x4_vertical_vp8_c(uint8_t *src, const uint8_t *topright, int stride){
+     const unsigned lt = src[-1-1*stride];
+@@ -495,12 +499,14 @@
+     h->pred16x16_add[ HOR_PRED8x8]= FUNCC(pred16x16_horizontal_add        , depth);\
+ 
+     switch (bit_depth) {
++#if !AVD_8BIT_ONLY
+         case 9:
+             H264_PRED(9)
+             break;
+         case 10:
+             H264_PRED(10)
+             break;
++#endif
+         default:
+             H264_PRED(8)
+             break;
+diff -ruN ffmpeg-old/libavcodec/ppc/h264_altivec.c s3/ff/libavcodec/ppc/h264_altivec.c
+--- ffmpeg-old/libavcodec/ppc/h264_altivec.c	2026-11-14 09:01:37.734055358 +0000
++++ s3/ff/libavcodec/ppc/h264_altivec.c	2026-11-14 20:20:28.740029391 +0000
+@@ -312,7 +312,7 @@
+     va = vec_add(va, vdst_ss);                                \
+     va_u8 = vec_packsu(va, zero_s16v);                        \
+     va_u32 = vec_splat((vec_u32)va_u8, 0);                  \
+-    vec_ste(va_u32, element, (uint32_t*)dst);
++    vec_ste(va_u32, element, (unsigned int*)dst);
+ 
+ static void ff_h264_idct_add_altivec(uint8_t *dst, DCTELEM *block, int stride)
+ {
+diff -ruN ffmpeg-old/libavcodec/ppc/int_altivec.c s3/ff/libavcodec/ppc/int_altivec.c
+--- ffmpeg-old/libavcodec/ppc/int_altivec.c	2026-11-14 09:01:37.734055358 +0000
++++ s3/ff/libavcodec/ppc/int_altivec.c	2026-11-14 20:21:26.742609949 +0000
+@@ -86,7 +86,7 @@
+     register vec_s16 vec1, *pv;
+     register vec_s32 res = vec_splat_s32(0), t;
+     register vec_u32 shifts;
+-    int32_t ires;
++    int ires; /* AVCDecLib: int32_t is long on Retro68; vec_ste needs int* */
+ 
+     shifts = zero_u32v;
+     if(shift & 0x10) shifts = vec_add(shifts, vec_sl(vec_splat_u32(0x08), vec_splat_u32(0x1)));
+@@ -120,7 +120,7 @@
+     register vec_s16 i2 = pv2[0], i3 = pv3[0];
+     register vec_s32 res = zero_s32v;
+     register vec_u8 align = vec_lvsl(0, v2);
+-    int32_t ires;
++    int ires; /* AVCDecLib: see above */
+     order >>= 4;
+     do {
+         t0 = vec_perm(i2, pv2[1], align);

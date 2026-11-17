@@ -10,7 +10,9 @@
 #ifndef H264CODEC_H_INCLUDED
 #define H264CODEC_H_INCLUDED
 
-#define kH264CodecVersion       0x00010000  /* 1.0.0, bump as we go */
+#ifndef kH264CodecVersion
+#define kH264CodecVersion       0x00010000  /* 1.0.0, bump as we go (16t test build: 0x00010010) */
+#endif
 
 /* Component identity -- MUST match between the .r resource's 'thng'
    template and anywhere else we refer to ourselves. Subtype 'avc1' is

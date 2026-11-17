@@ -1,0 +1,110 @@
+--- Retro68/PEFTools/MakePEF.cc.orig	2026-11-14 19:57:30.812381368 +0000
++++ Retro68/PEFTools/MakePEF.cc	2026-11-14 20:54:11.568960783 +0000
+@@ -194,12 +194,22 @@
+     {
+         int32_t hash = 0;
+ 
+-        for(char c : str)
+-            hash = ((hash << 1) - (hash >> 16)) ^ c;
++        /* Apple PEFComputeHashWord: SInt32 accumulator (arithmetic >>16), UInt8 chars.
++           Plain 'char' is signed on x86 hosts, which corrupted hashes of non-ASCII names;
++           do the shift/subtract in uint32_t to avoid signed-overflow UB. */
++        for(unsigned char c : str)
++            hash = (int32_t)((((uint32_t)hash << 1) - (uint32_t)(hash >> 16)) ^ c);
+         
+         return uint32_t( (str.size() << 16) | ((hash ^ (hash >> 16)) & 0xFFFF) );
+     }
+ 
++    /* CFM's PEFHashTableIndex: (word ^ (word >> power)) & (size-1).
++       Was "key % sz", which only agrees with CFM when power == 0 (< 10 exports). */
++    uint32_t hashIndex(uint32_t key, int sz) const
++    {
++        return (key ^ (key >> power_)) & (uint32_t)(sz - 1);
++    }
++
+     void build()
+     {
+         int sz;
+@@ -211,10 +221,10 @@
+         table.resize(sz);
+ 
+         std::sort(symbols.begin(), symbols.end(),
+-            [sz](const auto& a, const auto& b) { return a.key % sz < b.key % sz; });
++            [this, sz](const auto& a, const auto& b) { return hashIndex(a.key, sz) < hashIndex(b.key, sz); });
+         
+         for(const auto& sym : symbols)
+-            table[sym.key % sz] += 1 << 18;
++            table[hashIndex(sym.key, sz)] += 1 << 18;
+         
+         int off = 0;
+ 
+@@ -454,15 +464,20 @@
+     memset(&loaderSectionHeader, 0, sizeof(loaderSectionHeader));
+     
+     int textSize = get(xcoffSections[".text"].s_size);
++    /* d20: 16-byte align section container offsets (and declare 2^4 alignment) so that
++       AltiVec constant pools in .text/.data (read with lvx) stay 16-byte aligned when CFM
++       uses the sections in place. Previously .text started at 0x7C (== 12 mod 16). */
++    auto align16 = [](int x) { return (x + 15) & ~15; };
++    int textOff = align16(sizeof(PEFContainerHeader) + 3*sizeof(PEFSectionHeader));
+     textSectionHeader.nameOffset = -1;
+     textSectionHeader.defaultAddress = 0;
+     textSectionHeader.totalLength = textSize;
+     textSectionHeader.unpackedLength = textSize;
+     textSectionHeader.containerLength = textSize;
+-    textSectionHeader.containerOffset = sizeof(PEFContainerHeader) + 3*sizeof(PEFSectionHeader);
++    textSectionHeader.containerOffset = textOff;
+     textSectionHeader.sectionKind = kPEFCodeSection;
+     textSectionHeader.shareKind = kPEFGlobalShare;
+-    textSectionHeader.alignment = 2;
++    textSectionHeader.alignment = 4;
+ 
+     int dataSize = get(xcoffSections[".data"].s_size);
+     dataSectionHeader.nameOffset = -1;
+@@ -470,10 +485,10 @@
+     dataSectionHeader.totalLength = dataSize + get(xcoffSections[".bss"].s_size);
+     dataSectionHeader.unpackedLength = dataSize;
+     dataSectionHeader.containerLength = dataSize;
+-    dataSectionHeader.containerOffset = sizeof(PEFContainerHeader) + 3*sizeof(PEFSectionHeader) + textSize;
++    dataSectionHeader.containerOffset = align16(textOff + textSize);
+     dataSectionHeader.sectionKind = kPEFUnpackedDataSection;
+     dataSectionHeader.shareKind = kPEFProcessShare;
+-    dataSectionHeader.alignment = 2;
++    dataSectionHeader.alignment = 4;
+ 
+     loaderInfoHeader.importedLibraryCount = importLibs.size()-1;
+     loaderInfoHeader.totalImportedSymbolCount = totalImportedSyms;
+@@ -510,8 +525,7 @@
+     loaderSectionHeader.totalLength = 0;
+     loaderSectionHeader.unpackedLength = 0;
+     loaderSectionHeader.containerLength = loaderInfoHeader.exportHashOffset + exports.size();
+-    loaderSectionHeader.containerOffset = sizeof(PEFContainerHeader) + 3*sizeof(PEFSectionHeader)
+-                                            + textSize + dataSize;
++    loaderSectionHeader.containerOffset = align16(align16(textOff + textSize) + dataSize);
+     loaderSectionHeader.sectionKind = kPEFLoaderSection;
+     loaderSectionHeader.shareKind = kPEFGlobalShare;
+     loaderSectionHeader.alignment = 2;
+@@ -533,6 +547,7 @@
+     {
+         char *buf = new char[textSize];
+         
++        while((int)out.tellp() < textOff) out.put(0);
+         in.seekg(get(xcoffSections[".text"].s_scnptr));
+         in.read(buf, textSize);
+         out.write(buf, textSize);
+@@ -541,6 +556,7 @@
+     {
+         char *buf = new char[dataSize];
+         
++        while((int)out.tellp() < align16(textOff + textSize)) out.put(0);
+         in.seekg(get(xcoffSections[".data"].s_scnptr));
+         in.read(buf, dataSize);
+         out.write(buf, dataSize);
+@@ -548,6 +564,7 @@
+     }
+     if(verboseFlag)
+         std::cerr << "done.\n";
++    while((int)out.tellp() < align16(align16(textOff + textSize) + dataSize)) out.put(0);
+     eswap(&loaderInfoHeader);
+     out.write((char*)&loaderInfoHeader, sizeof(loaderInfoHeader));
+     

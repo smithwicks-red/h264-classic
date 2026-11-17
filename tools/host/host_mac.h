@@ -134,6 +134,15 @@ static OSErr FlushVol(ConstStr255Param vol, short v) { (void)vol; (void)v; retur
 static OSErr FindFolder(short v, OSType t, Boolean c, short *fv, long *fd)
 { (void)v; (void)t; (void)c; gHostFileCalls++; *fv = 0; *fd = 0; return noErr; }
 
+/* ---------------- Gestalt (v16t): AltiVec only if H264_HOST_ALTIVEC=1 ---------------- */
+static OSErr Gestalt(OSType sel, long *resp)
+{
+    const char *e = getenv("H264_HOST_ALTIVEC");
+    if (sel != 'ppcf') return -5551;
+    *resp = (e != NULL && e[0] == '1') ? (1L << 4) : 0;
+    return noErr;
+}
+
 /* ---------------- Timer ---------------- */
 typedef struct { UInt32 hi; UInt32 lo; } UnsignedWide;
 typedef struct { SInt32 hi; UInt32 lo; } wide;
@@ -259,25 +268,27 @@ static Ptr NewPtr(Size n)
 {
     long *p;
     if (gHostPtrFailAbove >= 0 && (long)n > gHostPtrFailAbove) { gHostPtrFails++; return NULL; }
-    p = (long *)malloc((size_t)n + 16);
+    /* v16t: blocks start 8 bytes past a 16-byte boundary, like the
+       Memory Manager may give: the codec must align by itself. */
+    p = (long *)malloc((size_t)n + 24);
     if (p == NULL) return NULL;
     p[0] = (long)n;
     gHostPtrAllocs++; HostCount((long)n);
-    return (Ptr)p + 16;
+    return (Ptr)p + 24;
 }
 static Ptr NewPtrClear(Size n) { Ptr p = NewPtr(n); if (p) memset(p, 0, (size_t)n); return p; }
 static void DisposePtr(Ptr p)
 {
     long *q;
     if (p == NULL) return;
-    q = (long *)(p - 16);
+    q = (long *)(p - 24);
     gHostLiveBlocks--; gHostLiveBytes -= q[0];
     free(q);
 }
 static Handle HostNewHandle(Size n, int temp, int clear)
 {
     HostMaster *m = (HostMaster *)malloc(sizeof(HostMaster));
-    m->data = (Ptr)(clear ? calloc(1, (size_t)n + 1) : malloc((size_t)n + 1));
+    m->data = (Ptr)(clear ? calloc(1, (size_t)n + 9) : malloc((size_t)n + 9)) + 8;   /* v16t: misaligned by 8 */
     m->size = (long)n; m->temp = temp;
     HostCount((long)n);
     return (Handle)m;
@@ -294,7 +305,7 @@ static void DisposeHandle(Handle h)
     HostMaster *m = (HostMaster *)h;
     if (h == NULL) return;
     gHostLiveBlocks--; gHostLiveBytes -= m->size;
-    free(m->data); free(m);
+    free(m->data - 8); free(m);
 }
 static Size GetHandleSize(Handle h) { return (Size)((HostMaster *)h)->size; }
 static void HLock(Handle h) { (void)h; }
@@ -309,11 +320,25 @@ static void SetComponentInstanceStorage(ComponentInstance ci, Handle storage)
 { (void)ci; gHostInstanceStorage = (void *)storage; }
 
 static const unsigned char *gHostAvcC; static long gHostAvcCSize;
+/* v17: the 'rdly' extension (-1 = absent), and AVCDecLib stand-ins:
+   missing library, or a library that reports another version. */
+static long gHostRdly = -1;
+static int  gHostAvcMissing;
+static unsigned long gHostAvcFakeVersion;
 static OSErr GetImageDescriptionExtension(ImageDescriptionHandle d, Handle *ext, OSType type, long index)
 {
     Handle h;
-    (void)d; (void)type; (void)index;
-    if (gHostAvcC == NULL) return -1;
+    (void)d; (void)index;
+    if (type == 'rdly')
+    {
+        if (gHostRdly < 0) return -2026;    /* not found */
+        h = HostNewHandle(4, 0, 0);
+        (*h)[0] = (char)(gHostRdly >> 24); (*h)[1] = (char)(gHostRdly >> 16);
+        (*h)[2] = (char)(gHostRdly >> 8);  (*h)[3] = (char)gHostRdly;
+        *ext = h;
+        return noErr;
+    }
+    if (type != 'avcC' || gHostAvcC == NULL) return -1;
     h = HostNewHandle((Size)gHostAvcCSize, 0, 0);
     memcpy(*h, gHostAvcC, (size_t)gHostAvcCSize);
     *ext = h;

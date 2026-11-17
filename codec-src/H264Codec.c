@@ -127,6 +127,24 @@
 #include "avcC_parse.h"
 #include "H264Codec.h"
 
+/* v16t: one source, two decoders. 0 (default) = h264bsd, linked in.
+   1 = AVCDecLib (FFmpeg 0.8.15 H.264 in a separate LGPL 'shlb'), loaded at
+   first use with GetSharedLibrary and called through a table of 8 entry
+   points. Everything else (dispatch, pixel writers, lateness policy,
+   logging, error survival) is shared. */
+#ifndef H264_BACKEND_AVCDEC
+#define H264_BACKEND_AVCDEC 0
+#endif
+#if H264_BACKEND_AVCDEC
+#include "AVCDecAPI.h"
+#ifndef H264_HOST_BUILD
+#include <CodeFragments.h>
+#endif
+#define H264_HAVE_DECODER(g) ((g)->avc != NULL)
+#else
+#define H264_HAVE_DECODER(g) ((g)->h264 != NULL)
+#endif
+
 /* ==================================================================
    Build configuration
    ==================================================================
@@ -384,7 +402,7 @@ static void DumpBytesToShare(H264GlobalsPtr glob, const char *pathC,
 /* Calls remembered by the timing trace (kH264TimingTrace), and how many
    numbers are kept for each. 900 calls is 30 seconds at 30 fps. */
 #define kTraceCalls   900
-#define kTraceFields  13
+#define kTraceFields  19   /* v17: + 6 for the discontinuity trace */
 
 /* ------------------------------------------------------------------
    Globals record
@@ -538,6 +556,58 @@ struct H264Globals {
     long                traceCount;
     unsigned long       traceSum;       /* checksum of the last picture this call produced */
     Boolean             tracedThisCall; /* this call has a row in the trace */
+
+#if H264_BACKEND_AVCDEC
+    /* ---- AVCDecLib backend (v16t) ---- */
+    H264AvcFns          av;             /* the library's 8 entry points */
+    Boolean             avLoaded;
+#ifndef H264_HOST_BUILD
+    CFragConnectionID   avConn;
+#endif
+    AVCDecContext      *avc;            /* decoder context, or NULL */
+    AVCDecPicture       avPic;          /* the picture lastPic belongs to */
+    u8                 *avcCopy;        /* the avcC record, kept to reopen */
+    long                avcCSize;
+    Boolean             avAltiVec;      /* AltiVec requested from the library */
+    Boolean             avInfoLogged;
+    /* v17: fixed reorder delay (stage 5, B-frames). See H264AvSample. */
+    long                avRdly;         /* N from the 'rdly' extension, -1 if none */
+    long                avDelay;        /* N: pictures the decoder holds back */
+    Boolean             avDelayFns;     /* library has the 0x00080F02 entry points */
+    Boolean             avHavePrevSample; /* avPrevSize/avPrevSum are valid */
+    Boolean             avHaveNext;     /* avNextLo: the start time (low word) a successor has */
+    Boolean             avAfterReset;   /* paint the next decoded picture at once */
+    Boolean             avGate;         /* open GOP: hide pictures before the key */
+    long                avKeyPoc;
+    unsigned long       avNextLo;
+    long                avNextScale;
+    long                avPrevFrameNumber;
+    unsigned long       statResets;     /* discontinuities onto a key frame: decoder reset */
+    unsigned long       statJumpsNoKey; /* discontinuities onto a non-key sample: no reset */
+    unsigned long       statGated;      /* leading pictures not painted after a reset */
+    unsigned long       statTail;       /* 1-byte samples: one held picture out */
+    Boolean             avRdlyHolds;    /* v17b: N came from 'rdly': the component enforces it */
+    unsigned long       statRdlyTakes;  /* pictures taken early to hold the delay at N */
+    unsigned long       statRdlyLost;   /* pictures that came out together and were not shown */
+    Boolean             avPicValid;
+    Boolean             avMono;         /* v17c: after a non-key jump: no picture older than the last shown */
+    Boolean             avLastPocValid;
+    long                avLastPoc;      /* POC of the last picture shown */
+    unsigned long       statStaleHidden; /* pictures not shown because older than one shown */     /* v17: lastPic was returned by the LAST library call */
+    Boolean             avHaveSig;
+    unsigned long       avDstSig;       /* first bytes of the destination after our last paint */
+    unsigned long       statKept;       /* calls that left the destination as it was */
+    unsigned long       statDstChanged; /* ... and found it changed behind our back */
+    unsigned long       statBlackRepaints; /* repaint impossible (new buffer, stale picture): black */
+    u8                 *avBuf;          /* v17: sample copy + kAvPad zero bytes (FFmpeg reads past the end) */
+    unsigned long       avBufSize;
+    unsigned long       avLibSpMod16;   /* r1 & 15 the library saw in avcdec_init */
+    unsigned long       avSpBad;        /* calls with sp & 15 != 0 inside BandDecompress */
+    unsigned long       statHeld;       /* samples decoded without a picture coming out */
+    unsigned long       avPrevSum;      /* checksum and size of the last sample decoded */
+    long                avPrevSize;
+    unsigned long       statIdrRepeats; /* key frames re-sent back to back, not decoded */
+#endif
 };
 
 /* Record one picture's arrival time for the run statistics. */
@@ -591,6 +661,10 @@ pascal ComponentResult H264CodecBandDecompress(H264GlobalsPtr glob,
    wrapped in an Annex-B start code, before any real sample arrives.
    Returns true if h264bsd accepted at least the SPS (PPS-without-SPS is
    a malformed-file situation we don't try to be clever about). */
+#if H264_BACKEND_AVCDEC
+static int FeedParameterSetsAvc(H264GlobalsPtr glob, const u8 *avcC, u32 avcCSize);
+#define FeedParameterSets FeedParameterSetsAvc
+#else
 static int FeedParameterSets(H264GlobalsPtr glob, const u8 *avcC, u32 avcCSize)
 {
     const u8 *sps[kMaxParamSets];
@@ -638,6 +712,7 @@ static int FeedParameterSets(H264GlobalsPtr glob, const u8 *avcC, u32 avcCSize)
 
     return 1;
 }
+#endif /* !H264_BACKEND_AVCDEC */
 
 /* ------------------------------------------------------------------
    YUV 4:2:0 -> 32-bit RGB conversion tables
@@ -802,6 +877,44 @@ static void BuildColorTables(void)
                gClamp[(((yv) + gu) >> 8) + kClampBias], \
                gClamp[(((yv) + bu) >> 8) + kClampBias])
 
+/* v16t: where the picture to paint lives. h264bsd hands over one
+   contiguous planar buffer (coded size, crop reported separately);
+   AVCDecLib hands over three planes with their own strides, already
+   cropped. The writers take everything from here. */
+typedef struct
+{
+    const u8 *y, *cb, *cr;
+    long      yStride, cStride;
+    u32       srcW, srcH;
+    u32       cropFlag, cropL, cropW, cropT, cropH;
+} H264Src;
+
+static void H264GetSrc(H264GlobalsPtr glob, const u8 *yuv, H264Src *s)
+{
+#if H264_BACKEND_AVCDEC
+    (void)yuv;
+    s->y  = glob->avPic.plane[0];
+    s->cb = glob->avPic.plane[1];
+    s->cr = glob->avPic.plane[2];
+    s->yStride = glob->avPic.stride[0];
+    s->cStride = glob->avPic.stride[1];
+    s->srcW = (u32)glob->avPic.width;
+    s->srcH = (u32)glob->avPic.height;
+    s->cropFlag = 0; s->cropL = s->cropW = s->cropT = s->cropH = 0;
+    if (s->y == NULL || s->cb == NULL || s->cr == NULL) s->srcW = s->srcH = 0;
+#else
+    s->srcW = (u32)h264bsdPicWidth(glob->h264)  * 16;
+    s->srcH = (u32)h264bsdPicHeight(glob->h264) * 16;
+    s->cropFlag = s->cropL = s->cropW = s->cropT = s->cropH = 0;
+    h264bsdCroppingParams(glob->h264, &s->cropFlag, &s->cropL, &s->cropW, &s->cropT, &s->cropH);
+    s->y  = yuv;
+    s->cb = yuv + ((long)s->srcW * s->srcH);
+    s->cr = s->cb + (((long)s->srcW * s->srcH) >> 2);
+    s->yStride = (long)s->srcW;
+    s->cStride = (long)(s->srcW >> 1);
+#endif
+}
+
 static void CopyPlanarYUVToPixMap(H264GlobalsPtr glob, const u8 *yuv,
                                    CodecDecompressParams *params)
 {
@@ -809,6 +922,8 @@ static void CopyPlanarYUVToPixMap(H264GlobalsPtr glob, const u8 *yuv,
     u32 dstW, dstH;
     u32 left = 0, top = 0;
     u32 cropFlag = 0, cropL = 0, cropW = 0, cropT = 0, cropH = 0;
+    H264Src sp;
+    long lumaStride;
 
     const u8 *yPlane;
     const u8 *cbPlane;
@@ -821,16 +936,18 @@ static void CopyPlanarYUVToPixMap(H264GlobalsPtr glob, const u8 *yuv,
     u8  *frameBase;
     u32  yy, pairs;
 
-    if (glob == NULL || glob->h264 == NULL || yuv == NULL || params == NULL) return;
+    if (glob == NULL || !H264_HAVE_DECODER(glob) || yuv == NULL || params == NULL) return;
 
     /* Geometry straight from the decoder -- never from our globals. */
-    srcW = (u32)h264bsdPicWidth(glob->h264)  * 16;
-    srcH = (u32)h264bsdPicHeight(glob->h264) * 16;
+    H264GetSrc(glob, yuv, &sp);
+    srcW = sp.srcW;
+    srcH = sp.srcH;
     if (srcW == 0 || srcH == 0) return;
 
     /* h264bsd decodes in whole macroblocks and reports the visible
        window separately; honour it so we paint the clean aperture. */
-    h264bsdCroppingParams(glob->h264, &cropFlag, &cropL, &cropW, &cropT, &cropH);
+    cropFlag = sp.cropFlag; cropL = sp.cropL; cropW = sp.cropW;
+    cropT = sp.cropT; cropH = sp.cropH;
     if (cropFlag && cropW > 0 && cropH > 0)
     {
         dstW = cropW; dstH = cropH; left = cropL; top = cropT;
@@ -861,10 +978,11 @@ static void CopyPlanarYUVToPixMap(H264GlobalsPtr glob, const u8 *yuv,
 
     frameBase = (u8 *)baseAddr + originY * rowBytes + originX * 4;
 
-    yPlane  = yuv;
-    cbPlane = yuv + ((long)srcW * srcH);
-    crPlane = cbPlane + (((long)srcW * srcH) >> 2);
-    chromaStride = srcW >> 1;
+    yPlane  = sp.y;
+    cbPlane = sp.cb;
+    crPlane = sp.cr;
+    chromaStride = (u32)sp.cStride;
+    lumaStride = sp.yStride;
 
     BuildColorTables();
 
@@ -872,8 +990,8 @@ static void CopyPlanarYUVToPixMap(H264GlobalsPtr glob, const u8 *yuv,
 
     for (yy = 0; yy < dstH; yy += 2)
     {
-        const u8 *yRow0 = yPlane + (long)(yy + top) * srcW + left;
-        const u8 *yRow1 = yRow0 + srcW;
+        const u8 *yRow0 = yPlane + (long)(yy + top) * lumaStride + left;
+        const u8 *yRow1 = yRow0 + lumaStride;
 
         u32 cRow = ((yy + top) >> 1);
         const u8 *cbRow = cbPlane + (long)cRow * chromaStride + (left >> 1);
@@ -973,6 +1091,8 @@ static void CopyPlanarYUVToRGB16(H264GlobalsPtr glob, const u8 *yuv,
     u32 dstW, dstH;
     u32 left = 0, top = 0;
     u32 cropFlag = 0, cropL = 0, cropW = 0, cropT = 0, cropH = 0;
+    H264Src sp;
+    long lumaStride;
 
     const u8 *yPlane;
     const u8 *cbPlane;
@@ -985,13 +1105,15 @@ static void CopyPlanarYUVToRGB16(H264GlobalsPtr glob, const u8 *yuv,
     u8  *frameBase;
     u32  yy, pairs;
 
-    if (glob == NULL || glob->h264 == NULL || yuv == NULL || params == NULL) return;
+    if (glob == NULL || !H264_HAVE_DECODER(glob) || yuv == NULL || params == NULL) return;
 
-    srcW = (u32)h264bsdPicWidth(glob->h264)  * 16;
-    srcH = (u32)h264bsdPicHeight(glob->h264) * 16;
+    H264GetSrc(glob, yuv, &sp);
+    srcW = sp.srcW;
+    srcH = sp.srcH;
     if (srcW == 0 || srcH == 0) return;
 
-    h264bsdCroppingParams(glob->h264, &cropFlag, &cropL, &cropW, &cropT, &cropH);
+    cropFlag = sp.cropFlag; cropL = sp.cropL; cropW = sp.cropW;
+    cropT = sp.cropT; cropH = sp.cropH;
     if (cropFlag && cropW > 0 && cropH > 0)
     {
         dstW = cropW; dstH = cropH; left = cropL; top = cropT;
@@ -1019,10 +1141,11 @@ static void CopyPlanarYUVToRGB16(H264GlobalsPtr glob, const u8 *yuv,
 
     frameBase = (u8 *)baseAddr + originY * rowBytes + originX * 2;
 
-    yPlane  = yuv;
-    cbPlane = yuv + ((long)srcW * srcH);
-    crPlane = cbPlane + (((long)srcW * srcH) >> 2);
-    chromaStride = srcW >> 1;
+    yPlane  = sp.y;
+    cbPlane = sp.cb;
+    crPlane = sp.cr;
+    chromaStride = (u32)sp.cStride;
+    lumaStride = sp.yStride;
 
     BuildColorTables();
 
@@ -1033,7 +1156,7 @@ static void CopyPlanarYUVToRGB16(H264GlobalsPtr glob, const u8 *yuv,
        cases. The chroma row is simply read twice. */
     for (yy = 0; yy < dstH; yy++)
     {
-        const u8 *yRow  = yPlane + (long)(yy + top) * srcW + left;
+        const u8 *yRow  = yPlane + (long)(yy + top) * lumaStride + left;
         u32       cRow  = ((yy + top) >> 1);
         const u8 *cbRow = cbPlane + (long)cRow * chromaStride + (left >> 1);
         const u8 *crRow = crPlane + (long)cRow * chromaStride + (left >> 1);
@@ -1100,17 +1223,21 @@ typedef struct
 {
     u32  srcW, srcH;
     u32  dstW, dstH;
+    const u8 *y, *cb, *cr;      /* v16t: planes and strides from H264GetSrc */
+    long yStride, cStride;
     u32  left, top;
     long originX, originY;
     long rowBytes;
     Ptr  baseAddr;
 } H264BlitGeom;
 
-static Boolean ComputeBlitGeometry(H264GlobalsPtr glob,
+static Boolean ComputeBlitGeometry(H264GlobalsPtr glob, const u8 *yuv,
                                     CodecDecompressParams *params,
                                     H264BlitGeom *g)
 {
     u32 cropFlag = 0, cropL = 0, cropW = 0, cropT = 0, cropH = 0;
+    H264Src sp;
+    long lumaStride;
 
     g->left = 0;
     g->top  = 0;
@@ -1119,11 +1246,16 @@ static Boolean ComputeBlitGeometry(H264GlobalsPtr glob,
        that receives BandDecompress is not always the one PreDecompress
        ran on, so cached geometry can read back as zero exactly when it
        is needed. This cost us a blank picture once already. */
-    g->srcW = (u32)h264bsdPicWidth(glob->h264)  * 16;
-    g->srcH = (u32)h264bsdPicHeight(glob->h264) * 16;
+    H264GetSrc(glob, yuv, &sp);
+    g->srcW = sp.srcW;
+    g->srcH = sp.srcH;
+    g->y = sp.y; g->cb = sp.cb; g->cr = sp.cr;
+    g->yStride = sp.yStride; g->cStride = sp.cStride;
+    (void)lumaStride;
     if (g->srcW == 0 || g->srcH == 0) return false;
 
-    h264bsdCroppingParams(glob->h264, &cropFlag, &cropL, &cropW, &cropT, &cropH);
+    cropFlag = sp.cropFlag; cropL = sp.cropL; cropW = sp.cropW;
+    cropT = sp.cropT; cropH = sp.cropH;
     if (cropFlag && cropW > 0 && cropH > 0)
     {
         g->dstW = cropW; g->dstH = cropH;
@@ -1184,13 +1316,13 @@ static void CopyPlanarYUVTo2vuy(H264GlobalsPtr glob, const u8 *yuv,
     u32 chromaStride, yy, pairs;
     u8 *frameBase;
 
-    if (!ComputeBlitGeometry(glob, params, &g)) return;
+    if (!ComputeBlitGeometry(glob, yuv, params, &g)) return;
     if (g.rowBytes <= 0) return;
 
-    yPlane  = yuv;
-    cbPlane = yuv + ((long)g.srcW * g.srcH);
-    crPlane = cbPlane + (((long)g.srcW * g.srcH) >> 2);
-    chromaStride = g.srcW >> 1;
+    yPlane  = g.y;
+    cbPlane = g.cb;
+    crPlane = g.cr;
+    chromaStride = (u32)g.cStride;
 
     frameBase = (u8 *)g.baseAddr + g.originY * g.rowBytes + g.originX * 2;
 
@@ -1198,7 +1330,7 @@ static void CopyPlanarYUVTo2vuy(H264GlobalsPtr glob, const u8 *yuv,
 
     for (yy = 0; yy < g.dstH; yy++)
     {
-        const u8 *yRow  = yPlane + (long)(yy + g.top) * g.srcW + g.left;
+        const u8 *yRow  = yPlane + (long)(yy + g.top) * g.yStride + g.left;
         u32       cRow  = ((yy + g.top) >> 1);
         const u8 *cbRow = cbPlane + (long)cRow * chromaStride + (g.left >> 1);
         const u8 *crRow = crPlane + (long)cRow * chromaStride + (g.left >> 1);
@@ -1254,7 +1386,7 @@ static void CopyPlanarYUVToY420(H264GlobalsPtr glob, const u8 *yuv,
     long  yRB, cbRB, crRB;
     u32   chromaStride, yy, halfH, halfW;
 
-    if (!ComputeBlitGeometry(glob, params, &g)) return;
+    if (!ComputeBlitGeometry(glob, yuv, params, &g)) return;
 
     ppi = (PlanarPixmapInfoYUV420 *)g.baseAddr;
 
@@ -1276,14 +1408,14 @@ static void CopyPlanarYUVToY420(H264GlobalsPtr glob, const u8 *yuv,
     dstCb += (g.originY >> 1) * cbRB + (g.originX >> 1);
     dstCr += (g.originY >> 1) * crRB + (g.originX >> 1);
 
-    yPlane  = yuv;
-    cbPlane = yuv + ((long)g.srcW * g.srcH);
-    crPlane = cbPlane + (((long)g.srcW * g.srcH) >> 2);
-    chromaStride = g.srcW >> 1;
+    yPlane  = g.y;
+    cbPlane = g.cb;
+    crPlane = g.cr;
+    chromaStride = (u32)g.cStride;
 
     for (yy = 0; yy < g.dstH; yy++)
     {
-        BlockMoveData(yPlane + (long)(yy + g.top) * g.srcW + g.left,
+        BlockMoveData(yPlane + (long)(yy + g.top) * g.yStride + g.left,
                       dstY + (long)yy * yRB,
                       (Size)g.dstW);
     }
@@ -1399,9 +1531,42 @@ static Boolean SameDestinationAsLastBlit(H264GlobalsPtr glob,
 #define H264_HOST_BLIT_HOOK()
 #endif
 
+#if H264_BACKEND_AVCDEC
+/* v17: a checksum of the first (up to) 16 bytes of the destination's
+   first row: lets the trace show whether the destination still holds
+   what we painted when we leave it alone. */
+static unsigned long H264DstSig(CodecDecompressParams *params)
+{
+    OSType fmt = H264_PIXMAP_FORMAT(params->dstPixMap);
+    long   ox  = (long)params->dstRect.left - (long)params->dstPixMap.bounds.left;
+    long   oy  = (long)params->dstRect.top  - (long)params->dstPixMap.bounds.top;
+    long   rb  = (long)(params->dstPixMap.rowBytes & 0x3FFF), bpp, k;
+    const u8 *base = (const u8 *)params->dstPixMap.baseAddr, *p;
+    unsigned long a = 1, b = 0;
+    if (base == NULL || ox < 0 || oy < 0) return 0;
+    if (fmt == kYUV420CodecType)
+    {
+        const PlanarPixmapInfoYUV420 *ppi = (const PlanarPixmapInfoYUV420 *)base;
+        p = base + ppi->componentInfoY.offset + oy * (long)ppi->componentInfoY.rowBytes + ox;
+    }
+    else
+    {
+        bpp = (fmt == k422YpCbCr8CodecType) ? 2 : params->dstPixMap.pixelSize / 8;
+        if (fmt == k422YpCbCr8CodecType) ox &= ~1L;
+        p = base + oy * rb + ox * bpp;
+    }
+    for (k = 0; k < 16; k++) { a += p[k]; b += a; }
+    return (b << 16) ^ a;
+}
+#endif
+
 static void NoteBlit(H264GlobalsPtr glob, CodecDecompressParams *params)
 {
     H264_HOST_BLIT_HOOK();
+#if H264_BACKEND_AVCDEC
+    glob->avDstSig  = H264DstSig(params);
+    glob->avHaveSig = true;
+#endif
     glob->haveLastBlit     = true;
     glob->lastBlitBase     = (Ptr)params->dstPixMap.baseAddr;
     glob->lastBlitRowBytes = (long)(params->dstPixMap.rowBytes & 0x3FFF);
@@ -1415,7 +1580,7 @@ static void BlitPicture(H264GlobalsPtr glob, const u8 *yuv,
 {
     OSType fmt;
 
-    if (glob == NULL || glob->h264 == NULL || yuv == NULL || params == NULL)
+    if (glob == NULL || !H264_HAVE_DECODER(glob) || yuv == NULL || params == NULL)
         return;
 
     fmt = H264_PIXMAP_FORMAT(params->dstPixMap);
@@ -1819,40 +1984,51 @@ typedef struct
     long   pad;         /* keeps the header at 16 bytes on PowerPC */
 } H264MemHeader;
 
+/* v16t: the block handed back is ALWAYS 16-byte aligned. Neither NewPtr
+   nor a locked temporary handle promises that, and AVCDecLib's AltiVec
+   code needs it, so 15 spare bytes are taken and the header is placed
+   just below the first aligned address. pad keeps where the Ptr really
+   starts. */
+#define H264_ALIGN16(a) (((unsigned long)(a) + 15UL) & ~15UL)
 void *H264MemAlloc(unsigned long size)
 {
     H264MemHeader *hdr;
+    char          *raw;
+    Size           total;
 
     if (size == 0) size = 4;    /* like malloc(0): hand back something freeable */
+    total = (Size)(size + sizeof(H264MemHeader) + 15);
 
-    hdr = (H264MemHeader *)NewPtr((Size)(size + sizeof(H264MemHeader)));
-    if (hdr != NULL)
+    raw = (char *)NewPtr(total);
+    if (raw != NULL)
     {
+        hdr = ((H264MemHeader *)H264_ALIGN16(raw + sizeof(H264MemHeader))) - 1;
         hdr->mark  = kH264MemMarkPtr;
         hdr->tempH = NULL;
         hdr->size  = (long)size;
-        hdr->pad   = 0;
+        hdr->pad   = (long)raw;
         return (void *)(hdr + 1);
     }
 
-    if (size >= kH264TempMinBytes)
+    /* v16t: with AVCDecLib every size may fall back -- FFmpeg 0.8 does not
+       check all of its small allocations. */
+    if (size >= kH264TempMinBytes || H264_BACKEND_AVCDEC)
     {
         OSErr  err = noErr;
-        Handle h   = TempNewHandle((Size)(size + sizeof(H264MemHeader)), &err);
-
+        Handle h   = TempNewHandle(total, &err);
         if (h != NULL && err == noErr)
         {
             HLock(h);
-            hdr = (H264MemHeader *)*h;
+            raw = (char *)*h;
+            hdr = ((H264MemHeader *)H264_ALIGN16(raw + sizeof(H264MemHeader))) - 1;
             hdr->mark  = kH264MemMarkTemp;
             hdr->tempH = h;
             hdr->size  = (long)size;
-            hdr->pad   = 0;
+            hdr->pad   = (long)raw;
             return (void *)(hdr + 1);
         }
         if (h != NULL) DisposeHandle(h);
     }
-
     return NULL;
 }
 
@@ -1867,7 +2043,7 @@ void H264MemFree(void *ptr)
     if (hdr->mark == kH264MemMarkPtr)
     {
         hdr->mark = 0;
-        DisposePtr((Ptr)hdr);
+        DisposePtr((Ptr)hdr->pad);
     }
     else if (hdr->mark == kH264MemMarkTemp)
     {
@@ -1878,6 +2054,540 @@ void H264MemFree(void *ptr)
     }
     /* else: not one of ours. Leave it. */
 }
+
+#if H264_BACKEND_AVCDEC
+/* ==================================================================
+   v16t: the AVCDecLib backend
+   ==================================================================
+   AVCDecLib is FFmpeg 0.8.15's H.264 decoder in its own CFM shared
+   library (LGPL). This component only loads it and calls its 8 plain C
+   entry points through glob->av; nothing of FFmpeg is compiled in here.
+
+   The library allocates through our H264MemAlloc/H264MemFree (16-byte
+   aligned, application heap first, temporary memory second). No log
+   callback: FFmpeg reports every concealed error, and writing those to
+   the shared volume would cost more than the decode. */
+
+#ifdef H264_HOST_BUILD
+/* the host harness links AVCDecLib's objects directly */
+unsigned long  avcdec_version(void);
+long           avcdec_init(const AVCDecCallbacks *, unsigned long, unsigned long *);
+AVCDecContext *avcdec_open(const unsigned char *, long);
+long           avcdec_feed_annexb(AVCDecContext *, const unsigned char *, long, long *, AVCDecPicture *);
+long           avcdec_decode_sample(AVCDecContext *, const unsigned char *, long, AVCDecPicture *);
+long           avcdec_flush(AVCDecContext *, AVCDecPicture *);
+void           avcdec_reset(AVCDecContext *);
+void           avcdec_close(AVCDecContext *);
+long           avcdec_set_skip(AVCDecContext *, long, long);
+long           avcdec_get_delay(AVCDecContext *);
+long           avcdec_set_delay(AVCDecContext *, long);
+long           avcdec_take_lowest(AVCDecContext *, AVCDecPicture *, long *);
+long           avcdec_held(AVCDecContext *);
+long           avcdec_peek_lowest(AVCDecContext *, AVCDecPicture *, long *);
+#ifndef H264_HOST_AVC_DECODE
+#define H264_HOST_AVC_DECODE avcdec_decode_sample
+#endif
+#ifndef H264_HOST_AVC_WRAP
+#define H264_HOST_AVC_WRAP(n) avcdec_##n
+#endif
+#endif
+
+/* v17: every call into AVCDecLib goes through H264_AV, which first marks
+   the picture we hold (lastPic, avPic) as no longer readable: after any
+   later library call FFmpeg may have released or reused its buffer. */
+#define H264_AV(g) (*((g)->avPicValid = false, &(g)->av))
+/* v17c: which exports invalidate (checked against avcdec.c, 0x00080F02):
+     decode_sample, take_lowest, peek_lowest, reset, flush, feed_annexb,
+     open, close, init  -> H264_AV: they decode, release, refill c->frame
+                           or free pictures.
+     get_delay, held     -> H264_AVQ: read has_b_frames / count the queue.
+     set_delay, set_skip -> H264_AVQ: store avctx/H264Context fields only;
+                           no picture is released or written.
+     version             -> no context at all. */
+#define H264_AVQ(g) ((g)->av)
+
+static void *H264AvAlloc(void *opaque, unsigned long size)
+{
+    (void)opaque;
+    return H264MemAlloc(size);
+}
+
+static void H264AvRelease(void *opaque, void *ptr)
+{
+    (void)opaque;
+    H264MemFree(ptr);
+}
+
+/* r1, the stack pointer, as the caller sees it. AltiVec code saves
+   vector registers with 16-byte stores that silently drop the low 4
+   address bits, so FFmpeg's AltiVec paths need r1 & 15 == 0. */
+#if defined(H264_HOST_BUILD)
+static unsigned long H264GetSP(void)
+{
+#if defined(__powerpc__)
+    unsigned long sp;
+    __asm__ volatile ("mr %0,1" : "=r" (sp));
+    return sp;
+#else
+    return (unsigned long)__builtin_frame_address(0);
+#endif
+}
+#else
+static asm unsigned long H264GetSP(void)
+{
+    nofralloc
+    mr      r3, r1
+    blr
+}
+#endif
+
+static Boolean H264HasAltiVec(void)
+{
+    long resp = 0;
+    /* gestaltPowerPCProcessorFeatures 'ppcf', bit
+       gestaltPowerPCHasVectorInstructions (4) */
+    if (Gestalt('ppcf', &resp) != noErr) return false;
+    return (Boolean)((resp & (1L << 4)) != 0);
+}
+
+/* Find AVCDecLib and its 8 entry points. Once per instance: a CFM
+   connection belongs to the process that made it, and QuickTime opens
+   instances in every application that plays a movie. */
+static OSErr H264LoadAvc(H264GlobalsPtr glob)
+{
+    unsigned long ver;
+    if (glob->avLoaded) return noErr;
+#ifdef H264_HOST_BUILD
+    if (gHostAvcMissing)
+    {
+        LogNum(glob, "UNSUPPORTED (black): AVCDecLib not found; GetSharedLibrary err", -2804L);
+        return -8962;
+    }
+    glob->av.version       = H264_HOST_AVC_WRAP(version);
+    glob->av.init          = H264_HOST_AVC_WRAP(init);
+    glob->av.open          = H264_HOST_AVC_WRAP(open);
+    glob->av.feed_annexb   = H264_HOST_AVC_WRAP(feed_annexb);
+    glob->av.decode_sample = H264_HOST_AVC_DECODE;
+    glob->av.flush         = H264_HOST_AVC_WRAP(flush);
+    glob->av.reset         = H264_HOST_AVC_WRAP(reset);
+    glob->av.close         = H264_HOST_AVC_WRAP(close);
+    glob->av.set_skip      = H264_HOST_AVC_WRAP(set_skip);
+    glob->av.get_delay     = H264_HOST_AVC_WRAP(get_delay);
+    glob->av.set_delay     = H264_HOST_AVC_WRAP(set_delay);
+    glob->av.take_lowest   = H264_HOST_AVC_WRAP(take_lowest);
+    glob->av.held          = H264_HOST_AVC_WRAP(held);
+    glob->av.peek_lowest   = H264_HOST_AVC_WRAP(peek_lowest);
+#else
+    {
+        static const unsigned char *const kNames[14] = {
+            "\pavcdec_version", "\pavcdec_init", "\pavcdec_open",
+            "\pavcdec_feed_annexb", "\pavcdec_decode_sample",
+            "\pavcdec_flush", "\pavcdec_reset", "\pavcdec_close",
+            "\pavcdec_set_skip", "\pavcdec_get_delay", "\pavcdec_set_delay",
+            "\pavcdec_take_lowest", "\pavcdec_held", "\pavcdec_peek_lowest" };
+        Ptr       mainAddr = NULL;
+        Str255    errName;
+        OSErr     err, err2 = noErr;
+        int       i;
+        Ptr      *slot = (Ptr *)&glob->av;
+
+        /* 1. by name: CFM looks in the application's folder, the
+              Extensions folder and the System file */
+        err = GetSharedLibrary("\pAVCDecLib", kPowerPCCFragArch, kReferenceCFrag,
+                               &glob->avConn, &mainAddr, errName);
+        if (err == noErr)
+            LogAppend(glob, "AVCDecLib found by GetSharedLibrary");
+        else
+        {
+            /* 2. by file: Extensions folder, then the System Folder */
+            short  vRef;
+            long   dirID;
+            FSSpec spec;
+            OSType where[2];
+            int    w;
+            where[0] = kExtensionFolderType;
+            where[1] = kSystemFolderType;
+            err2 = fnfErr;
+            for (w = 0; w < 2 && err2 != noErr; w++)
+            {
+                if (FindFolder(kOnSystemDisk, where[w], kDontCreateFolder, &vRef, &dirID) == noErr &&
+                    FSMakeFSSpec(vRef, dirID, "\pAVCDecLib", &spec) == noErr)
+                    err2 = GetDiskFragment(&spec, 0, kCFragGoesToEOF, "\pAVCDecLib",
+                                           kReferenceCFrag, &glob->avConn, &mainAddr, errName);
+            }
+            if (err2 != noErr)
+            {
+                LogNum(glob, "UNSUPPORTED (black): AVCDecLib not found; GetSharedLibrary err", (long)err);
+                return -8962;   /* codecUnimpErr */
+            }
+            LogNum(glob, "AVCDecLib found by GetDiskFragment (GetSharedLibrary err)", (long)err);
+        }
+        for (i = 0; i < 8; i++)
+        {
+            CFragSymbolClass cls;
+            Ptr addr = NULL;
+            if (FindSymbol(glob->avConn, kNames[i], &addr, &cls) != noErr || addr == NULL)
+            {
+                LogNum(glob, "UNSUPPORTED (black): AVCDecLib lacks export #", (long)i);
+                CloseConnection(&glob->avConn);
+                return -8962;
+            }
+            slot[i] = addr;
+        }
+        /* v17: the 6 delay/skip entry points, only from a library that
+           says it has them; a missing one means "old library". */
+        if (glob->av.version() >= kAVCDecVersionSkipDelay)
+            for (i = 8; i < 14; i++)
+            {
+                CFragSymbolClass cls;
+                Ptr addr = NULL;
+                if (FindSymbol(glob->avConn, kNames[i], &addr, &cls) != noErr) addr = NULL;
+                slot[i] = addr;
+            }
+    }
+#endif
+    ver = glob->av.version();
+#ifdef H264_HOST_BUILD
+    if (gHostAvcFakeVersion != 0) ver = gHostAvcFakeVersion;
+#endif
+    glob->avDelayFns = (Boolean)(ver >= kAVCDecVersionSkipDelay && glob->av.set_skip != NULL &&
+                                 glob->av.get_delay != NULL && glob->av.set_delay != NULL &&
+                                 glob->av.take_lowest != NULL && glob->av.held != NULL &&
+                                 glob->av.peek_lowest != NULL);
+    if (!glob->avDelayFns)
+    {
+        glob->av.set_skip = NULL; glob->av.get_delay = NULL; glob->av.set_delay = NULL;
+        glob->av.take_lowest = NULL; glob->av.held = NULL; glob->av.peek_lowest = NULL;
+    }
+    if (ver < kAVCDecMinVersion || (ver >> 24) != 0)
+    {
+        LogNum(glob, "UNSUPPORTED (black): AVCDecLib version", (long)ver);
+#ifndef H264_HOST_BUILD
+        CloseConnection(&glob->avConn);
+#endif
+        return -8962;
+    }
+    glob->avLoaded = true;
+    return noErr;
+}
+
+/* ---- a small SPS reader: only what decides "reordering or not" ---- */
+typedef struct
+{
+    const u8 *p;
+    u32       bits, pos;
+    int       err;
+} H264Bits;
+
+static u32 BrBit(H264Bits *b)
+{
+    u32 v;
+    if (b->pos >= b->bits) { b->err = 1; return 0; }
+    v = (u32)(b->p[b->pos >> 3] >> (7 - (b->pos & 7))) & 1;
+    b->pos++;
+    return v;
+}
+static u32 BrBits(H264Bits *b, int k)
+{
+    u32 v = 0;
+    while (k-- > 0) v = (v << 1) | BrBit(b);
+    return v;
+}
+static u32 BrUe(H264Bits *b)
+{
+    int z = 0;
+    while (!BrBit(b))
+    {
+        if (b->err || ++z > 31) { b->err = 1; return 0; }
+    }
+    return ((1UL << z) - 1) + BrBits(b, z);
+}
+static long BrSe(H264Bits *b)
+{
+    u32 k = BrUe(b);
+    return (k & 1) ? (long)((k + 1) >> 1) : -(long)(k >> 1);
+}
+/* Remove emulation-prevention bytes (00 00 03 -> 00 00). */
+static u32 H264Unescape(const u8 *src, u32 n, u8 *dst, u32 max)
+{
+    u32 i, o = 0, zeros = 0;
+    for (i = 0; i < n && o < max; i++)
+    {
+        if (zeros >= 2 && src[i] == 3) { zeros = 0; continue; }
+        zeros = (src[i] == 0) ? zeros + 1 : 0;
+        dst[o++] = src[i];
+    }
+    return o;
+}
+static void BrHrd(H264Bits *b)
+{
+    u32 cnt = BrUe(b) + 1, i;
+    BrBits(b, 8);
+    for (i = 0; i < cnt && i < 32 && !b->err; i++) { BrUe(b); BrUe(b); BrBit(b); }
+    BrBits(b, 20);
+}
+
+typedef struct
+{
+    u32 profile, pocType, frameMbsOnly;
+    u32 bsr, numReorder;
+    u32 chroma, bitDepth;           /* v17: chroma_format_idc, max(luma, chroma) bit depth */
+    u32 codedW, codedH, cropL, cropR, cropT, cropB;
+} H264SpsInfo;
+
+/* Returns 1 if parsed to the end of what we need. */
+static int H264ParseSps(const u8 *nal, u32 n, H264SpsInfo *o)
+{
+    u8       buf[512];
+    H264Bits b;
+    u32      i, mbW, mapH;
+    memset(o, 0, sizeof(*o));
+    o->chroma = 1; o->bitDepth = 8;
+    if (n < 4) return 0;
+    b.p = buf; b.pos = 0; b.err = 0;
+    b.bits = H264Unescape(nal + 1, n - 1, buf, sizeof(buf)) * 8;
+    o->profile = BrBits(&b, 8);
+    BrBits(&b, 16);                 /* constraint flags, level */
+    BrUe(&b);                       /* seq_parameter_set_id */
+    if (o->profile == 100 || o->profile == 110 || o->profile == 122 ||
+        o->profile == 244 || o->profile == 44  || o->profile == 83  ||
+        o->profile == 86  || o->profile == 118 || o->profile == 128)
+    {
+        u32 chroma = BrUe(&b), dl, dc;
+        if (chroma == 3) BrBit(&b);
+        dl = BrUe(&b) + 8; dc = BrUe(&b) + 8; BrBit(&b);
+        o->chroma = chroma; o->bitDepth = (dl > dc) ? dl : dc;
+        if (BrBit(&b))              /* seq_scaling_matrix_present_flag */
+        {
+            for (i = 0; i < ((chroma != 3) ? 8u : 12u) && !b.err; i++)
+            {
+                if (BrBit(&b))
+                {
+                    long last = 8, next = 8;
+                    u32 j, size = (i < 6) ? 16 : 64;
+                    for (j = 0; j < size && !b.err; j++)
+                    {
+                        if (next != 0) next = (last + BrSe(&b) + 256) % 256;
+                        if (next != 0) last = next;
+                    }
+                }
+            }
+        }
+    }
+    BrUe(&b);                       /* log2_max_frame_num_minus4 */
+    o->pocType = BrUe(&b);
+    if (o->pocType == 0) BrUe(&b);
+    else if (o->pocType == 1)
+    {
+        u32 k;
+        BrBit(&b); BrSe(&b); BrSe(&b);
+        k = BrUe(&b);
+        for (i = 0; i < k && i < 256 && !b.err; i++) BrSe(&b);
+    }
+    BrUe(&b); BrBit(&b);            /* max_num_ref_frames, gaps */
+    mbW  = BrUe(&b) + 1;
+    mapH = BrUe(&b) + 1;
+    o->frameMbsOnly = BrBit(&b);
+    if (!o->frameMbsOnly) BrBit(&b);
+    BrBit(&b);                      /* direct_8x8_inference */
+    o->codedW = mbW * 16;
+    o->codedH = mapH * 16 * (2 - o->frameMbsOnly);
+    if (BrBit(&b))
+    {
+        u32 uy = 2 * (2 - o->frameMbsOnly);
+        o->cropL = BrUe(&b) * 2; o->cropR = BrUe(&b) * 2;
+        o->cropT = BrUe(&b) * uy; o->cropB = BrUe(&b) * uy;
+    }
+    if (BrBit(&b))                  /* vui_parameters_present_flag */
+    {
+        u32 nal_hrd, vcl_hrd;
+        if (BrBit(&b)) { if (BrBits(&b, 8) == 255) BrBits(&b, 32); }
+        if (BrBit(&b)) BrBit(&b);
+        if (BrBit(&b)) { BrBits(&b, 4); if (BrBit(&b)) BrBits(&b, 24); }
+        if (BrBit(&b)) { BrUe(&b); BrUe(&b); }
+        if (BrBit(&b)) { BrBits(&b, 32); BrBits(&b, 32); BrBit(&b); }
+        nal_hrd = BrBit(&b); if (nal_hrd) BrHrd(&b);
+        vcl_hrd = BrBit(&b); if (vcl_hrd) BrHrd(&b);
+        if (nal_hrd || vcl_hrd) BrBit(&b);
+        BrBit(&b);                  /* pic_struct_present_flag */
+        if (BrBit(&b))              /* bitstream_restriction_flag */
+        {
+            BrBit(&b); BrUe(&b); BrUe(&b); BrUe(&b); BrUe(&b);
+            o->numReorder = BrUe(&b);
+            BrUe(&b);
+            o->bsr = !b.err;
+        }
+    }
+    return !b.err;
+}
+
+/* v17: zero bytes kept after every buffer handed to AVCDecLib. FFmpeg
+   0.8.15 needs FF_INPUT_BUFFER_PADDING_SIZE = 8; 16 keeps sizes aligned. */
+#define kAvPad 16
+
+/* v17: is this sample a key frame: an IDR slice, or only I slices
+   (an open-GOP recovery point)? */
+static Boolean H264SampleIsKey(const u8 *p, u32 size, u32 lengthSize)
+{
+    u32 pos = 0, slices = 0, iSlices = 0;
+    if (p == NULL || lengthSize < 1 || lengthSize > 4) return false;
+    while (pos + lengthSize < size)
+    {
+        u32 n = 0, i, type;
+        for (i = 0; i < lengthSize; i++) n = (n << 8) | p[pos + i];
+        pos += lengthSize;
+        if (n == 0 || n > size - pos) break;
+        type = (u32)(p[pos] & 0x1F);
+        if (type == 5) return true;
+        if (type == 1 || type == 2)
+        {
+            u8 buf[16];
+            H264Bits b;
+            u32 st;
+            b.p = buf; b.pos = 0; b.err = 0;
+            b.bits = H264Unescape(p + pos + 1, (n - 1 < 12) ? n - 1 : 12, buf, sizeof(buf)) * 8;
+            BrUe(&b);               /* first_mb_in_slice */
+            st = BrUe(&b);
+            slices++;
+            if (!b.err && (st % 5) == 2) iSlices++;
+        }
+        pos += n;
+    }
+    return (Boolean)(slices > 0 && iSlices == slices);
+}
+
+/* (Re)open the decoder context from the saved avcC. AltiVec only if the
+   CPU has it AND the stack is 16-byte aligned on this call. */
+static int H264AvOpen(H264GlobalsPtr glob)
+{
+    AVCDecCallbacks cb;
+    unsigned long   flags = 0;
+    if (glob->avc != NULL) { H264_AV(glob).close(glob->avc); glob->avc = NULL; }
+    glob->lastPic = NULL;
+    glob->avPic.plane[0] = NULL;
+    cb.alloc   = H264AvAlloc;
+    cb.release = H264AvRelease;
+    cb.log     = NULL;
+    cb.opaque  = NULL;
+    if (glob->avAltiVec) flags |= AVCDEC_FLAG_ALTIVEC;
+    if (H264_AV(glob).init(&cb, flags, &glob->avLibSpMod16) != 0) return 0;
+    glob->avc = H264_AV(glob).open(glob->avcCopy, glob->avcCSize);
+    glob->avAfterReset = true;     /* v17: the first picture is shown at once, as after a reset */
+    glob->avGate       = false;
+    glob->avPicValid   = false;
+    glob->avHavePrevSample = false;   /* v17c: a new context has seen no sample */
+    glob->avMono       = false;
+    glob->avLastPocValid = false;
+    if (glob->avc != NULL && glob->av.set_delay != NULL && glob->avDelay > 0)
+        H264_AVQ(glob).set_delay(glob->avc, glob->avDelay);
+    return glob->avc != NULL;
+}
+
+static int FeedParameterSetsAvc(H264GlobalsPtr glob, const u8 *avcC, u32 avcCSize)
+{
+    const u8   *sps[kMaxParamSets];
+    u32         spsSizes[kMaxParamSets];
+    int         numSps = 0;
+    const u8   *pps[kMaxParamSets];
+    u32         ppsSizes[kMaxParamSets];
+    int         numPps = 0;
+    H264SpsInfo si;
+    long        newDelay;
+
+    if (!AVCC_Parse(avcC, avcCSize, &glob->lengthSize,
+                     sps, spsSizes, kMaxParamSets, &numSps,
+                     pps, ppsSizes, kMaxParamSets, &numPps) || numSps < 1)
+        return 0;
+
+    glob->unsupportedStream = false;
+    glob->streamProfile     = (avcCSize > 1) ? (u32)avcC[1] : 0;
+
+    if (!H264ParseSps(sps[0], spsSizes[0], &si)) return 0;
+    glob->frameWidth   = (long)si.codedW;
+    glob->frameHeight  = (long)si.codedH;
+    glob->haveCropInfo = (si.cropL | si.cropR | si.cropT | si.cropB) != 0;
+    glob->cropLeft = si.cropL; glob->cropTop = si.cropT;
+    glob->cropWidth = si.codedW - si.cropL - si.cropR;
+    glob->cropHeight = si.codedH - si.cropT - si.cropB;
+
+    /* What FFmpeg 0.8.15 cannot do here (AVD_8BIT_ONLY build, 4:2:0
+       writers): refuse with black, never with an error. */
+    if (si.bitDepth != 8 || si.chroma != 1)
+    {
+        glob->unsupportedStream = true;
+        LogNum(glob, "UNSUPPORTED (black): bit depth > 8 or not 4:2:0; profile_idc", (long)si.profile);
+        return 1;
+    }
+
+    /* v17: N, the fixed reorder delay. 1. the 'rdly' extension our moov
+       rewriter writes; 2. the SPS VUI num_reorder_frames; 3. Baseline
+       (profile 66, incl. Constrained Baseline) cannot reorder: 0;
+       4. anything else: 2, said once in the log. */
+    {
+        long n;
+        if (glob->avRdly >= 0) n = (glob->avRdly > 16) ? 16 : glob->avRdly;
+        else if (si.bsr) n = (si.numReorder > 16) ? 16 : (long)si.numReorder;
+        else if (si.profile == 66) n = 0;
+        else
+        {
+            n = 2;
+            LogNum(glob, "AVCDecLib: no 'rdly' and no VUI num_reorder_frames; reorder delay assumed", n);
+        }
+        if (n > 0 && !glob->avDelayFns)
+        {
+            glob->unsupportedStream = true;
+            LogNum(glob, "UNSUPPORTED (black): B-frames need AVCDecLib 0x00080F02 or later; this one is", (long)glob->av.version());
+            return 1;
+        }
+        newDelay = n;
+        glob->avRdlyHolds = (Boolean)(glob->avRdly >= 0 && glob->avDelayFns);
+    }
+
+    /* Same avcC as the context already has: keep the decoder state. */
+    if (glob->avc != NULL && glob->avcCopy != NULL && glob->avcCSize == (long)avcCSize &&
+        memcmp(glob->avcCopy, avcC, avcCSize) == 0)
+    {
+        if (newDelay > glob->avDelay && glob->av.set_delay != NULL)
+        {
+            glob->avDelay = newDelay;
+            H264_AVQ(glob).set_delay(glob->avc, newDelay);
+        }
+        return 1;
+    }
+    glob->avDelay = newDelay;
+
+    if (glob->avcCopy != NULL) { H264MemFree(glob->avcCopy); glob->avcCopy = NULL; }
+    /* v17: FFmpeg reads up to FF_INPUT_BUFFER_PADDING_SIZE (8 in 0.8.15)
+       bytes past any input: keep kAvPad zero bytes after the copy. */
+    glob->avcCopy = (u8 *)H264MemAlloc(avcCSize + kAvPad);
+    if (glob->avcCopy == NULL) return 0;
+    BlockMoveData(avcC, glob->avcCopy, (Size)avcCSize);
+    memset(glob->avcCopy + avcCSize, 0, kAvPad);
+    glob->avcCSize = (long)avcCSize;
+
+    glob->avAltiVec = H264HasAltiVec() && ((H264GetSP() & 15) == 0);
+    if (!H264AvOpen(glob))
+    {
+        glob->unsupportedStream = true;
+        LogAppend(glob, "UNSUPPORTED (black): AVCDecLib refused the avcC");
+    }
+    else if (!glob->avRdlyHolds && glob->av.get_delay != NULL && H264_AVQ(glob).get_delay(glob->avc) > glob->avDelay)
+        glob->avDelay = H264_AVQ(glob).get_delay(glob->avc);
+    return 1;
+}
+
+/* Once per instance, only when the log file exists. */
+static void H264AvLogInfo(H264GlobalsPtr glob, unsigned long spMod16)
+{
+    if (glob->avInfoLogged) return;
+    glob->avInfoLogged = true;
+    if (!LogEnabled(glob)) return;
+    LogNum(glob, "AVCDecLib version", (long)glob->av.version());
+    LogNum(glob, "AVCDecLib AltiVec (1 on, 0 off)", (long)glob->avAltiVec);
+    LogNum(glob, "AVCDecLib sp&15 inside BandDecompress", (long)spMod16);
+    LogNum(glob, "AVCDecLib sp&15 seen by avcdec_init", (long)glob->avLibSpMod16);
+}
+#endif /* H264_BACKEND_AVCDEC */
 
 /* ==================================================================
    Lazy decoder construction
@@ -1904,6 +2614,19 @@ void H264MemFree(void *ptr)
    first call that means "I am actually going to decode", it already
    parses the avcC and needs a live decoder to do it, and it can return a
    real OSErr that QuickTime will surface. */
+#if H264_BACKEND_AVCDEC
+/* AVCDecLib: load the library now; the context is opened when the avcC
+   arrives (FeedParameterSetsAvc). Missing library = codecUnimpErr, one
+   log line. */
+static OSErr EnsureDecoder(H264GlobalsPtr glob)
+{
+    OSErr err;
+    if (glob == NULL) return paramErr;
+    err = H264LoadAvc(glob);
+    if (err != noErr) glob->unsupportedStream = true;
+    return err;
+}
+#else
 static OSErr EnsureDecoder(H264GlobalsPtr glob)
 {
     if (glob == NULL) return paramErr;
@@ -1947,6 +2670,7 @@ static OSErr EnsureDecoder(H264GlobalsPtr glob)
 
     return noErr;
 }
+#endif /* !H264_BACKEND_AVCDEC */
 
 /* Open is the one entry point that arrives with glob == NULL: the
    Component Manager has no storage for this instance yet, and allocating
@@ -2003,6 +2727,29 @@ pascal ComponentResult H264CodecClose(H264GlobalsPtr glob, ComponentInstance sel
         LogPlaybackStats(glob);
         LogTimingTrace(glob);
 
+#if H264_BACKEND_AVCDEC
+        if (glob->statIdrRepeats != 0) LogNum(glob, "AVCDecLib re-sent key frames not decoded", (long)glob->statIdrRepeats);
+        if (glob->statHeld != 0) LogNum(glob, "AVCDecLib samples that gave no picture", (long)glob->statHeld);
+        if (glob->avDelay != 0) LogNum(glob, "AVCDecLib reorder delay N", glob->avDelay);
+        if (glob->statResets != 0) LogNum(glob, "AVCDecLib resets (jump onto a key frame)", (long)glob->statResets);
+        if (glob->statJumpsNoKey != 0) LogNum(glob, "AVCDecLib jumps onto a non-key sample (no reset)", (long)glob->statJumpsNoKey);
+        if (glob->statStaleHidden != 0) LogNum(glob, "AVCDecLib ... pictures older than one shown, not shown", (long)glob->statStaleHidden);
+        if (glob->statGated != 0) LogNum(glob, "AVCDecLib open-GOP leading pictures hidden", (long)glob->statGated);
+        if (glob->statTail != 0) LogNum(glob, "AVCDecLib one-byte tail samples", (long)glob->statTail);
+        if (glob->statRdlyTakes != 0) LogNum(glob, "AVCDecLib pictures taken early to hold N from rdly", (long)glob->statRdlyTakes);
+        if (glob->statRdlyLost != 0) LogNum(glob, "AVCDecLib pictures not shown (two out in one call)", (long)glob->statRdlyLost);
+        if (glob->statKept != 0) LogNum(glob, "AVCDecLib calls that left the destination alone", (long)glob->statKept);
+        if (glob->statDstChanged != 0) LogNum(glob, "AVCDecLib ... and found it changed (flag 512)", (long)glob->statDstChanged);
+        if (glob->statBlackRepaints != 0) LogNum(glob, "AVCDecLib black repaints (new buffer, no valid picture)", (long)glob->statBlackRepaints);
+        if (glob->avSpBad != 0) LogNum(glob, "AVCDecLib calls with sp&15 != 0", (long)glob->avSpBad);
+        if (glob->avc != NULL) { H264_AV(glob).close(glob->avc); glob->avc = NULL; }
+        if (glob->avcCopy != NULL) { H264MemFree(glob->avcCopy); glob->avcCopy = NULL; }
+        if (glob->avBuf != NULL) { H264MemFree(glob->avBuf); glob->avBuf = NULL; glob->avBufSize = 0; }
+#ifndef H264_HOST_BUILD
+        if (glob->avLoaded) CloseConnection(&glob->avConn);
+#endif
+        glob->avLoaded = false;
+#endif
         if (glob->h264 != NULL)
         {
             if (glob->h264Inited) h264bsdShutdown(glob->h264);
@@ -2179,6 +2926,13 @@ pascal ComponentResult H264CodecPreDecompress(H264GlobalsPtr glob, CodecDecompre
 
     if (p == NULL || glob == NULL) return paramErr;
 
+    /* v17c: QuickTime may hand over a new buffer at the address of one we
+       painted before: nothing painted so far counts after PreDecompress. */
+    glob->haveLastBlit = false;
+#if H264_BACKEND_AVCDEC
+    glob->avHaveSig = false;
+#endif
+
     /* Build the decoder now, on the first call that actually intends to
        decode. See the note on EnsureDecoder: doing this in Open turned
        every allocation failure into an invisible NULL from
@@ -2188,7 +2942,14 @@ pascal ComponentResult H264CodecPreDecompress(H264GlobalsPtr glob, CodecDecompre
     if (err != noErr)
     {
         VLogNum(glob, "PreDecompress FAIL EnsureDecoder", (long)err);
+#if H264_BACKEND_AVCDEC
+        /* v17: no library, or an unusable one: black, never an error
+           (an error makes QuickTime show a dialog). Logged once. */
+        desc = p->imageDescription;
+        goto negotiate;
+#else
         return err;
+#endif
     }
 
     desc = p->imageDescription;
@@ -2202,10 +2963,35 @@ pascal ComponentResult H264CodecPreDecompress(H264GlobalsPtr glob, CodecDecompre
        spell the selector kAVCCImageDescriptionExtension vs a raw 'avcC'
        OSType -- try the OSType form first since it's the oldest/most
        universally supported spelling. */
+#if H264_BACKEND_AVCDEC
+    /* v17: 'rdly', 4 bytes big-endian: the reorder delay our moov
+       rewriter stores next to the avcC. */
+    glob->avRdly = -1;
+    {
+        Handle rd = NULL;
+        if (GetImageDescriptionExtension(desc, &rd, 'rdly', 1) == noErr && rd != NULL)
+        {
+            if (GetHandleSize(rd) >= 4)
+            {
+                const u8 *q = (const u8 *)*rd;
+                unsigned long v = ((unsigned long)q[0] << 24) | ((unsigned long)q[1] << 16) |
+                                  ((unsigned long)q[2] << 8) | (unsigned long)q[3];
+                glob->avRdly = (v > 16UL) ? 16L : (long)v;
+            }
+            DisposeHandle(rd);
+        }
+    }
+#endif
     err = GetImageDescriptionExtension(desc, &avcCHandle, 'avcC', 1);
     if (err != noErr || avcCHandle == NULL)
     {
+#if H264_BACKEND_AVCDEC
+        glob->unsupportedStream = true;
+        LogAppend(glob, "UNSUPPORTED (black): no avcC in the image description");
+        goto negotiate;
+#else
         return badFormat; /* no avcC -> we don't know how to frame the NALs */
+#endif
     }
 
     HLock(avcCHandle);
@@ -2214,7 +3000,15 @@ pascal ComponentResult H264CodecPreDecompress(H264GlobalsPtr glob, CodecDecompre
                                     (u32)GetHandleSize(avcCHandle));
         HUnlock(avcCHandle);
         DisposeHandle(avcCHandle);
+#if H264_BACKEND_AVCDEC
+        if (!ok && !glob->unsupportedStream)
+        {
+            glob->unsupportedStream = true;
+            LogAppend(glob, "UNSUPPORTED (black): avcC or SPS not readable");
+        }
+#else
         if (!ok) return badFormat;
+#endif
     }
 
     if (glob->unsupportedStream)
@@ -2223,14 +3017,20 @@ pascal ComponentResult H264CodecPreDecompress(H264GlobalsPtr glob, CodecDecompre
            -8962, written as a number because its header is not included
            here), and say why in the log if there is one. Profile 66 is
            Baseline, 77 Main, 88 Extended, 100 High. */
+#if H264_BACKEND_AVCDEC
+        /* v17: already said in one log line; play black (see BandDecompress). */
+        goto negotiate;
+#else
         LogNum(glob, "UNSUPPORTED H.264 stream, profile_idc", (long)glob->streamProfile);
         LogAppend(glob, "  h264bsd refused its SPS or PPS: only Baseline (no CABAC, no B-frames) can be decoded");
         return -8962;
+#endif
     }
 
     /* Ask h264bsd what it actually decided after parsing the SPS -- this
        can legitimately differ from the ImageDescription's width/height
        (macroblock rounding), which is exactly why we keep both. */
+#if !H264_BACKEND_AVCDEC
     glob->frameWidth  = (long)h264bsdPicWidth(glob->h264)  * 16;
     glob->frameHeight = (long)h264bsdPicHeight(glob->h264) * 16;
 
@@ -2261,6 +3061,11 @@ pascal ComponentResult H264CodecPreDecompress(H264GlobalsPtr glob, CodecDecompre
         }
     }
 
+#endif /* !H264_BACKEND_AVCDEC: AVCDecLib takes length-prefixed samples as they are */
+
+#if H264_BACKEND_AVCDEC
+negotiate:
+#endif
     /* Negotiate the destination buffer with the ICM. See the header
        comment on this function for why each field is what it is.
        p->capabilities is supplied by the caller and is documented in
@@ -2391,12 +3196,68 @@ pascal ComponentResult H264CodecPreDecompress(H264GlobalsPtr glob, CodecDecompre
    remembered as the last picture -- it is a reference for the pictures
    that follow and it is what a later repaint must show -- but it is not
    copied to the destination. */
+/* v16t: what happens to one finished picture, for either decoder. */
+static void OutputOnePicture(H264GlobalsPtr glob, u8 *pic, CodecDecompressParams *params)
+{
+    if (glob->skipBlitThisCall)
+    {
+        glob->statBlitSkips++;
+        glob->blitSkips++;
+    }
+    else
+    {
+        BlitPicture(glob, pic, params);
+        glob->blitSkips = 0;
+    }
+    glob->lastPic = pic;
+    glob->picsOut++;
+
+#if kH264TimingTrace
+    if (glob->trace != NULL)
+    {
+        /* A checksum of the whole decoded picture (coded size, all
+           three planes), so a trace from the Mac can be compared
+           picture by picture with the host harness's output -- the
+           way to tell whether a compiler optimisation level changed
+           the decoder's results. Fletcher-style, 32 bits. */
+#if H264_BACKEND_AVCDEC
+            u32 a = 1, b = 0, k, row, plane;
+            (void)pic;
+            for (plane = 0; plane < 3; plane++)
+            {
+                u32 w = (u32)glob->avPic.width  >> (plane ? 1 : 0);
+                u32 h = (u32)glob->avPic.height >> (plane ? 1 : 0);
+                for (row = 0; row < h; row++)
+                {
+                    const u8 *r = glob->avPic.plane[plane] + (long)row * glob->avPic.stride[plane];
+                    for (k = 0; k < w; k++) { a += r[k]; b += a; }
+                }
+            }
+#else
+        u32 n = (u32)h264bsdPicWidth(glob->h264) * 16 *
+                (u32)h264bsdPicHeight(glob->h264) * 16 * 3 / 2;
+        u32 a = 1, b = 0, k;
+        for (k = 0; k < n; k++) { a += pic[k]; b += a; }
+#endif
+        glob->traceSum = (unsigned long)((b << 16) ^ a);
+    }
+#endif
+    if (glob->noDeblock) glob->statNoDeblockPics++;
+    if (LogEnabled(glob))
+    {
+        UnsignedWide now;
+        Microseconds(&now);
+        StatNotePicture(glob, (unsigned long)now.lo);
+    }
+}
+
+#if !H264_BACKEND_AVCDEC
 static void DrainOutputPictures(H264GlobalsPtr glob, CodecDecompressParams *params)
 {
     u32 picId, isIdr, numErrMbs;
     u8 *pic;
 
-    if (glob == NULL || glob->h264 == NULL || params == NULL) return;
+    if (glob == NULL || !H264_HAVE_DECODER(glob) || params == NULL) return;
 
     while ((pic = h264bsdNextOutputPicture(glob->h264, &picId, &isIdr,
                                             &numErrMbs)) != NULL)
@@ -2415,44 +3276,10 @@ static void DrainOutputPictures(H264GlobalsPtr glob, CodecDecompressParams *para
             DumpBytesToShare(glob, "share:h264piclast.yuv", pic, planarBytes);
         }
 
-        if (glob->skipBlitThisCall)
-        {
-            glob->statBlitSkips++;
-            glob->blitSkips++;
-        }
-        else
-        {
-            BlitPicture(glob, pic, params);
-            glob->blitSkips = 0;
-        }
-        glob->lastPic = pic;
-        glob->picsOut++;
-
-#if kH264TimingTrace
-        if (glob->trace != NULL)
-        {
-            /* A checksum of the whole decoded picture (coded size, all
-               three planes), so a trace from the Mac can be compared
-               picture by picture with the host harness's output -- the
-               way to tell whether a compiler optimisation level changed
-               the decoder's results. Fletcher-style, 32 bits. */
-            u32 n = (u32)h264bsdPicWidth(glob->h264) * 16 *
-                    (u32)h264bsdPicHeight(glob->h264) * 16 * 3 / 2;
-            u32 a = 1, b = 0, k;
-            for (k = 0; k < n; k++) { a += pic[k]; b += a; }
-            glob->traceSum = (unsigned long)((b << 16) ^ a);
-        }
-#endif
-        if (glob->noDeblock) glob->statNoDeblockPics++;
-
-        if (LogEnabled(glob))
-        {
-            UnsignedWide now;
-            Microseconds(&now);
-            StatNotePicture(glob, (unsigned long)now.lo);
-        }
+        OutputOnePicture(glob, pic, params);
     }
 }
+#endif
 
 /* ==================================================================
    Lateness policy (v14)
@@ -2703,6 +3530,13 @@ static int H264LatePolicy(H264GlobalsPtr glob, long lateMs,
                           Boolean hasIDR, Boolean disposable)
 {
     Boolean late = (Boolean)(lateMs >= kLateMs);
+#if H264_BACKEND_AVCDEC
+    /* v17: with a reorder delay every sample must be decoded (a sample
+       not decoded would shift every later picture): no drops. */
+    Boolean mayDrop = (Boolean)(glob->avDelay == 0);
+#else
+    Boolean mayDrop = true;
+#endif
 
     if (lateMs > glob->statMaxLateMs) glob->statMaxLateMs = lateMs;
 
@@ -2729,7 +3563,11 @@ static int H264LatePolicy(H264GlobalsPtr glob, long lateMs,
         if (glob->noDeblock && glob->onTimeStreak >= kOnTimeCallsToRecover)
         {
             glob->noDeblock = false;
+#if H264_BACKEND_AVCDEC
+            if (glob->av.set_skip != NULL && glob->avc != NULL) H264_AVQ(glob).set_skip(glob->avc, 0, 0);
+#else
             h264bsdSetSkipDeblocking(glob->h264, 0);
+#endif
         }
         return kActDecodeAndBlit;
     }
@@ -2742,7 +3580,7 @@ static int H264LatePolicy(H264GlobalsPtr glob, long lateMs,
     glob->prevLateMs = lateMs;
 
     /* 4. hopeless: wait for a key frame (never drop the key frame itself) */
-    if (!hasIDR && lateMs >= kLateHopelessMs &&
+    if (mayDrop && !hasIDR && lateMs >= kLateHopelessMs &&
         glob->losingStreak >= kLateHopelessCalls)
     {
         glob->waitIDR = true;
@@ -2752,7 +3590,7 @@ static int H264LatePolicy(H264GlobalsPtr glob, long lateMs,
     }
 
     /* 1. a frame nothing depends on */
-    if (disposable)
+    if (disposable && mayDrop)
     {
         glob->statNonRefSkips++;
         return kActDrop;
@@ -2761,11 +3599,22 @@ static int H264LatePolicy(H264GlobalsPtr glob, long lateMs,
     /* 3. deblocking filter off -- only while we are still losing ground.
        Catching up after a jump (lateness shrinking every call) is not a
        reason to degrade the picture until the next key frame. */
-    if (!glob->noDeblock && glob->losingStreak >= kLosingCallsNoDeblock &&
+    /* v17: AVCDecLib 0x00080F02+: skip_loop_filter on non-reference
+       pictures only, so no error carries over to later pictures. */
+#if H264_BACKEND_AVCDEC
+    if (glob->av.set_skip != NULL && glob->avc != NULL &&
+#else
+    if (
+#endif
+        !glob->noDeblock && glob->losingStreak >= kLosingCallsNoDeblock &&
         (lateMs >= kLateNoDeblockMs || glob->lateStreak >= kLateStreakNoDeblock))
     {
         glob->noDeblock = true;
+#if H264_BACKEND_AVCDEC
+        H264_AVQ(glob).set_skip(glob->avc, 1, 0);
+#else
         h264bsdSetSkipDeblocking(glob->h264, 1);
+#endif
         glob->statDeblockOffs++;
     }
 
@@ -2818,9 +3667,128 @@ static void H264TraceCall(H264GlobalsPtr glob, CodecDecompressParams *params,
         t[11] = (long)w.lo;
     }
     t[12] = 0;      /* filled in at the end of the call: see BandDecompressWork */
+    /* v17: the raw discontinuity signals (syncFrameTime; frameNumber is
+       t[0]), the sample size, and what the AVCDecLib path did (avFlags,
+       filled in at the end of the call: 1 discontinuity, 2 decoder reset,
+       128 destination left as it was, 256 black (new buffer, no valid
+       picture), 512 destination found changed since our last paint,
+       4 re-sent key frame not decoded, 8 one-byte tail sample, 16 picture
+       hidden (open GOP), 32 key frame, 64 first picture shown at once). */
+    t[13] = (params->syncFrameTime != NULL) ? (long)params->syncFrameTime->startTime.hi : -1;
+    t[14] = (params->syncFrameTime != NULL) ? (long)params->syncFrameTime->startTime.lo : -1;
+    t[15] = (params->syncFrameTime != NULL) ? (long)params->syncFrameTime->scale : -1;
+    t[16] = (params->syncFrameTime != NULL) ? (long)params->syncFrameTime->duration : -1;
+    t[17] = (long)params->bufferSize;
+    t[18] = 0;
     glob->traceCount++;
     glob->tracedThisCall = true;
 }
+
+#if H264_BACKEND_AVCDEC
+/* v17: is this sample NOT the successor of the one before it (seek, loop,
+   scrub)? QuickTime 6 passes syncFrameTime on every BandDecompress
+   (measured 2026-11-11: start time, scale and duration of the frame; no
+   frameTime). In linear play each start time is the previous start plus
+   the previous duration, exactly, in the media's time scale. Without
+   syncFrameTime, frameNumber (when non-zero) must count up by one.
+   Called for every sample, so the expected time always follows the last
+   sample QuickTime sent. */
+static Boolean H264AvJump(H264GlobalsPtr glob, CodecDecompressParams *params)
+{
+    const ICMFrameTimeInfo *st = params->syncFrameTime;
+    Boolean jump = false;
+    if (st != NULL && st->scale > 0)
+    {
+        /* v17c: ImageCodec.h: struct ICMFrameTimeInfo { wide startTime;
+           long scale; long duration; } with wide = { SInt32 hi; UInt32 lo; }.
+           Measured in QuickTime 6 (guest run b21): the times are in the
+           MOVIE time scale (1000, durations 33/34), and a negative start
+           (our rewriter's edit shift) arrives as hi = 0, lo = -33: hi is
+           not sign-extended. So hi is ignored and only the low word is
+           compared, modulo 2^32: successor <=> lo == prev lo + prev
+           duration (unsigned 32-bit arithmetic) and the same scale. A real
+           wrap of lo (49.7 days at scale 1000, 39.8 hours at 30000) is
+           handled by the same modular arithmetic; only a jump of exactly a
+           multiple of 2^32 units would be missed. */
+        unsigned long lo = (unsigned long)st->startTime.lo;
+        if (glob->avHaveNext && (lo != glob->avNextLo || (long)st->scale != glob->avNextScale))
+            jump = true;
+        glob->avNextLo    = (lo + (unsigned long)st->duration) & 0xFFFFFFFFUL;
+        glob->avNextScale = (long)st->scale;
+        glob->avHaveNext  = (Boolean)(st->duration > 0);
+    }
+    else
+    {
+        glob->avHaveNext = false;
+        if (params->frameNumber != 0 && glob->avPrevFrameNumber != 0)
+            jump = (Boolean)(params->frameNumber != glob->avPrevFrameNumber + 1);
+    }
+    glob->avPrevFrameNumber = (long)params->frameNumber;
+    return jump;
+}
+
+/* v17: one picture out of AVCDecLib. While the open-GOP gate is up
+   (after a reset), pictures that come before the key picture in display
+   order are the broken leading pictures: they are not shown, the key
+   picture stays up. The gate falls with the first picture at or after
+   the key. */
+static void H264AvShow(H264GlobalsPtr glob, const AVCDecPicture *pic, CodecDecompressParams *params)
+{
+    if (glob->avGate)
+    {
+        if (pic->poc < glob->avKeyPoc) { glob->statGated++; return; }
+        glob->avGate = false;
+    }
+    /* v17c: after a jump onto a non-key sample, the queue may still hold
+       pictures from before it: never go back in display order. A key
+       picture starts a new POC period and ends the guard. */
+    if (glob->avMono && !pic->key && glob->avLastPocValid && pic->poc <= glob->avLastPoc)
+    {
+        glob->statStaleHidden++;
+        return;
+    }
+    if (pic->key) glob->avMono = false;
+    glob->avLastPoc = pic->poc;
+    glob->avLastPocValid = glob->avDelayFns;
+    glob->avPic = *pic;
+    OutputOnePicture(glob, (u8 *)pic->plane[0], params);
+    glob->avPicValid = true;
+}
+
+/* v17: a call that brings no new picture to show (held, decode error,
+   re-sent key frame, empty tail, hidden open-GOP picture, lateness drop).
+   1. Same buffer and rectangle as our last paint: QuickTime keeps the
+      destination's contents between calls (assumption, see the trace
+      flag 512), so it already shows the right picture: do not draw.
+   2. Another buffer, and the last picture is still valid (no library
+      call since it came out): paint it.
+   3. Another buffer and no valid picture: black. Never read a picture
+      after a later library call. */
+static void H264AvKeep(H264GlobalsPtr glob, CodecDecompressParams *params, long *flags)
+{
+    if (SameDestinationAsLastBlit(glob, params))
+    {
+        glob->statKept++;
+        *flags |= 128;
+        if (glob->avHaveSig && H264DstSig(params) != glob->avDstSig)
+        {
+            glob->statDstChanged++;
+            *flags |= 512;
+        }
+        return;
+    }
+    if (glob->lastPic != NULL && glob->avPicValid)
+    {
+        BlitPicture(glob, glob->lastPic, params);
+        glob->statRepeats++;
+        return;
+    }
+    PaintBlack(params);
+    NoteBlit(glob, params);
+    glob->statBlackRepaints++;
+    *flags |= 256;
+}
+#endif
 
 /* The real work. H264CodecBandDecompress, below it, is a thin timing
    wrapper so that every return path is measured without threading a
@@ -2834,9 +3802,42 @@ static ComponentResult BandDecompressWork(H264GlobalsPtr glob,
     long dstRowBytes;
     unsigned long picsBefore;
     int action = kActDecodeAndBlit;
+#if H264_BACKEND_AVCDEC
+    Boolean avJump = false;
+    long    avFlags = 0;
+    unsigned long avGated0;
+#endif
 
     if (glob == NULL || params == NULL) return paramErr;
-    if (glob->h264 == NULL) return internalComponentErr;
+#if H264_BACKEND_AVCDEC
+    {
+        unsigned long sp = H264GetSP() & 15;
+        if (glob->avc != NULL)
+        {
+            H264AvLogInfo(glob, sp);
+            if (sp != 0)
+            {
+                glob->avSpBad++;
+                if (glob->avAltiVec)
+                {
+                    /* Never run AltiVec code on a misaligned stack: back to C. */
+                    LogAppend(glob, "AVCDecLib: sp&15 != 0 inside BandDecompress, AltiVec OFF, decoder reopened");
+                    glob->avAltiVec = false;
+                    if (!H264AvOpen(glob)) glob->unsupportedStream = true;
+                }
+            }
+        }
+    }
+    if (glob->unsupportedStream && glob->lastPic == NULL)
+    {
+        PaintBlack(params);
+        return noErr;
+    }
+    avJump = H264AvJump(glob, params);
+    if (avJump) avFlags |= 1;
+    avGated0 = glob->statGated;
+#endif
+    if (!H264_HAVE_DECODER(glob)) return internalComponentErr;
 
     if (glob->unsupportedStream && glob->lastPic == NULL)
     {
@@ -2898,8 +3899,12 @@ static ComponentResult BandDecompressWork(H264GlobalsPtr glob,
         /* Nothing is decoded. The destination must still show a picture:
            if this is not the buffer we painted last, paint the last
            picture into it. */
+#if H264_BACKEND_AVCDEC
+        H264AvKeep(glob, params, &avFlags);
+#else
         if (glob->lastPic != NULL && !SameDestinationAsLastBlit(glob, params))
             BlitPicture(glob, glob->lastPic, params);
+#endif
         return noErr;
     }
 
@@ -2925,6 +3930,174 @@ static ComponentResult BandDecompressWork(H264GlobalsPtr glob,
        new SPS activates, which also happens inside BandDecompress. The
        new block is taken BEFORE the old one is freed, so if memory is
        short we keep the old buffer and lose only this sample. */
+#if H264_BACKEND_AVCDEC
+    if ((u32)params->bufferSize > glob->statMaxSample)
+        glob->statMaxSample = (unsigned long)params->bufferSize;
+    {
+        /* v17: fixed reorder delay. Every sample is decoded; whatever
+           comes out is painted; a call that gives nothing repaints the
+           last picture (or black) below. */
+        const u8     *d = (const u8 *)params->data;
+        long          n = (long)params->bufferSize, k, r, poc;
+        unsigned long a = 1, b = 0;
+        Boolean       isKey, got;
+        AVCDecPicture pic;
+
+        if (n == 1)
+        {
+            /* A one-byte sample from our moov rewriter: no new data,
+               let the next held picture out. */
+            glob->statTail++;
+            avFlags |= 8;
+            memset(&pic, 0, sizeof(pic));
+            if (glob->av.take_lowest != NULL && H264_AV(glob).take_lowest(glob->avc, &pic, &poc) == 1)
+                H264AvShow(glob, &pic, params);
+            goto avDone;
+        }
+        isKey = H264SampleIsKey(d, (u32)n, glob->lengthSize);
+        if (isKey) avFlags |= 32;
+        /* QuickTime sends a key frame twice in a row (poster frame, then
+           playback; also after a seek). Decoding the copy would hold
+           every later picture back one more: not decoded, the call shows
+           what the last one showed. */
+        for (k = 0; k < n; k++) { a += d[k]; b += a; }
+        a = ((b & 0xFFFF) << 16) ^ a;
+        if (isKey && glob->avHavePrevSample && n == glob->avPrevSize && a == glob->avPrevSum)
+        {
+            glob->statIdrRepeats++;
+            avFlags |= 4;
+            goto avDone;
+        }
+        if (avJump)
+        {
+            if (isKey)
+            {
+                /* Seek, loop or scrub onto a key frame: start afresh. */
+                H264_AV(glob).reset(glob->avc);
+                if (glob->av.set_delay != NULL && glob->avDelay > 0)
+                    H264_AVQ(glob).set_delay(glob->avc, glob->avDelay);
+                glob->avAfterReset = true;
+                glob->avGate = false;
+                glob->avMono = false;
+                glob->avLastPocValid = false;
+                glob->avHavePrevSample = false;   /* v17c */
+                glob->statResets++;
+                avFlags |= 2;
+            }
+            else
+            {
+                /* v17c: QuickTime skipped samples (late, rate != 1, edit
+                   boundary). No reset: the references we have are the
+                   best there are. Until the next key picture, never show
+                   a picture older (lower POC) than one already shown. */
+                glob->statJumpsNoKey++;
+                glob->avMono = glob->avDelayFns;
+            }
+        }
+        /* QuickTime's sample has no padding after it: decode a padded copy.
+           The copy buffer only grows; the new block is taken before the
+           old one is freed (H264MemAlloc: application heap, then
+           temporary memory). */
+        if ((unsigned long)n + kAvPad > glob->avBufSize)
+        {
+            unsigned long want = ((unsigned long)n + kAvPad + 4095UL) & ~4095UL;
+            u8 *nb = (u8 *)H264MemAlloc(want);
+            if (nb != NULL)
+            {
+                if (glob->avBuf != NULL) H264MemFree(glob->avBuf);
+                glob->avBuf = nb;
+                glob->avBufSize = want;
+            }
+        }
+        if (glob->avBuf == NULL || (unsigned long)n + kAvPad > glob->avBufSize)
+        {
+            glob->statDecodeErrors++;   /* no memory for the copy: this sample is lost */
+            goto avDone;
+        }
+        BlockMoveData(d, glob->avBuf, (Size)n);
+        memset(glob->avBuf + n, 0, kAvPad);
+        memset(&pic, 0, sizeof(pic));
+        r = H264_AV(glob).decode_sample(glob->avc, glob->avBuf, n, &pic);
+        if (r < 0) { glob->statDecodeErrors++; glob->avHavePrevSample = false; }
+        else
+        {
+            /* v17c: only a sample the decoder took counts as "already decoded" */
+            glob->avHavePrevSample = true;
+            glob->avPrevSize = n;
+            glob->avPrevSum  = a;
+        }
+        got = (Boolean)(r == 1);
+        /* v17b: N from 'rdly' is held by the component. FFmpeg raises its
+           own delay back to the SPS's num_reorder_frames on every decode,
+           which can be more than the file really needs (x264 b-pyramid
+           declares 2, uses 1). Whenever FFmpeg holds more than N
+           pictures, take the lowest one out now. In steady state that is
+           exactly one per sample; if more come out at once only the last
+           is shown (logged). */
+        if (glob->avRdlyHolds && !got)
+        {
+            AVCDecPicture tp;
+            long          tpoc, extra;
+            /* Only when decode gave nothing (a picture it gave must not be
+               followed by any library call before it is shown). held() is
+               asked once, BEFORE taking, for the same reason. */
+            extra = H264_AVQ(glob).held(glob->avc) - glob->avDelay;
+            memset(&tp, 0, sizeof(tp));
+            while (extra-- > 0 && H264_AV(glob).take_lowest(glob->avc, &tp, &tpoc) == 1)
+            {
+                if (got)
+                {
+                    glob->statRdlyLost++;   /* a picture taken before is dropped unread */
+                    if (glob->statRdlyLost == 1) LogAppend(glob, "AVCDecLib: two pictures out in one call, one not shown");
+                }
+                pic = tp;
+                got = true;
+                glob->statRdlyTakes++;
+            }
+        }
+        if (!got)
+        {
+            if (r == 0) glob->statHeld++;
+            /* Right after a reset (or the first sample of the instance),
+               show the key picture now rather than N samples later. It
+               stays queued in the decoder. */
+            if (glob->avAfterReset && glob->av.peek_lowest != NULL &&
+                H264_AV(glob).peek_lowest(glob->avc, &pic, &poc) == 1)
+            {
+                glob->avAfterReset = false;
+                avFlags |= 64;
+                H264AvShow(glob, &pic, params);
+                glob->avGate = glob->avDelayFns;
+                glob->avKeyPoc = pic.poc;
+            }
+        }
+        else
+        {
+            H264AvShow(glob, &pic, params);
+            if (glob->avAfterReset)
+            {
+                glob->avAfterReset = false;
+                glob->avGate = glob->avDelayFns;
+                glob->avKeyPoc = pic.poc;
+            }
+        }
+        if (!glob->avRdlyHolds && glob->av.get_delay != NULL)
+        {
+            long dl = H264_AVQ(glob).get_delay(glob->avc);
+            if (dl > glob->avDelay)
+            {
+                glob->avDelay = dl;
+                LogNum(glob, "AVCDecLib: reorder delay grew to", dl);
+            }
+        }
+    }
+avDone:
+    if (glob->statGated != avGated0) avFlags |= 16;
+#if kH264TimingTrace
+    if (glob->tracedThisCall && glob->trace != NULL && glob->traceCount > 0)
+        glob->trace[(glob->traceCount - 1) * kTraceFields + 18] = avFlags;
+#endif
+#else
     if ((u32)params->bufferSize > glob->statMaxSample)
         glob->statMaxSample = (unsigned long)params->bufferSize;
     {
@@ -3083,6 +4256,8 @@ static ComponentResult BandDecompressWork(H264GlobalsPtr glob,
         }
     }
 
+#endif /* !H264_BACKEND_AVCDEC */
+
     /* PixMap.rowBytes packs flags (e.g. pixel-depth/pixmap-vs-bitmap bit)
        into its top two bits alongside the real byte count -- always mask
        with 0x3FFF before using it as a stride, per Inside Macintosh. */
@@ -3110,13 +4285,17 @@ static ComponentResult BandDecompressWork(H264GlobalsPtr glob,
            cached numbers. */
         LogNum(glob, "  instance (glob)", (long)glob);
         LogNum(glob, "  glob->frameWidth (cached, may be 0)", (long)glob->frameWidth);
+#if !H264_BACKEND_AVCDEC
         LogNum(glob, "  h264bsdPicWidth*16", (long)h264bsdPicWidth(glob->h264) * 16);
         LogNum(glob, "  h264bsdPicHeight*16", (long)h264bsdPicHeight(glob->h264) * 16);
+#endif
     }
 
     /* Anything still queued (a sample whose last NAL completed a
        picture) goes out here. */
+#if !H264_BACKEND_AVCDEC
     DrainOutputPictures(glob, params);
+#endif
 
 #if kH264TimingTrace
     if (glob->tracedThisCall && glob->trace != NULL && glob->traceCount > 0)
@@ -3142,11 +4321,22 @@ static ComponentResult BandDecompressWork(H264GlobalsPtr glob,
        skipped the blit: that one produced a picture, and was allowed to
        skip only because this same buffer already holds the previous
        one.) */
+#if H264_BACKEND_AVCDEC
+    if (glob->picsOut == picsBefore)
+    {
+        H264AvKeep(glob, params, &avFlags);
+#if kH264TimingTrace
+        if (glob->tracedThisCall && glob->trace != NULL && glob->traceCount > 0)
+            glob->trace[(glob->traceCount - 1) * kTraceFields + 18] = avFlags;
+#endif
+    }
+#else
     if (glob->picsOut == picsBefore && glob->lastPic != NULL)
     {
         BlitPicture(glob, glob->lastPic, params);
         glob->statRepeats++;
     }
+#endif
 
     return noErr;
 }
@@ -3296,7 +4486,7 @@ static void LogTimingTrace(H264GlobalsPtr glob)
     if (glob == NULL || glob->trace == NULL || glob->traceCount <= 0) return;
     if (!LogEnabled(glob)) return;
 
-    LogAppend(glob, "=== timing trace: T call frameNumber due now rate conditionFlags callerFlags lateMs action present scale duration wallUs picsum ===");
+    LogAppend(glob, "=== timing trace: T call frameNumber due now rate conditionFlags callerFlags lateMs action present scale duration wallUs picsum syncHi syncLo syncScale syncDur size avFlags ===");
 
     for (i = 0; i < glob->traceCount; i++)
     {
