@@ -10,6 +10,17 @@ C decoder, wrapped as a QuickTime image decompressor component and built with
 CodeWarrior Pro 8.3 under Mac OS 9. As far as we know nothing else like it
 exists for Mac OS 9.
 
+## New: decoder 17 (Main/High profile and B-frames, source only)
+
+The source now contains **decoder 17**, which adds FFmpeg 0.8.15's H.264 decoder as a
+second backend in a separate LGPL shared library (AVCDecLib). It plays Main and High
+profile video with B-frames, bit-exactly, in QuickTime Player 6 on a Mac mini G4: about
+15.6 ms per frame at 640x480 and 5 ms at 320x240, at full frame rate. It also fixes the
+"seeking straight onto a key frame" issue listed below for that backend. There are no
+binaries for it yet. Details: [`docs/DECODER-17.md`](docs/DECODER-17.md).
+
+The rest of this page describes the released v15 kit.
+
 ## What is in this release
 
 | Part | Version | Status |

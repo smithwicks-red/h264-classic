@@ -50,11 +50,33 @@
                        without waiting -- QuickTime catching up after a jump
       --prebuf-first   give PreDecompress bufferSize = the FIRST sample's
                        size, as QuickTime 6 does (v15), not the largest
+    v17 (stage 5, B-frames):
+      --mode qt:FILE   lines "SAMPLE CONDITIONFLAGS": the calls QuickTime makes
+                       (seek model: preroll calls carry codecConditionCatchUpDiff)
+      --times FILE     one line per sample "START DURATION SCALE" (media time);
+                       syncFrameTime is passed on every call (QuickTime 6 does).
+                       Without it: START = sample*1001, scale 30000.
+      --no-synctime    pass no syncFrameTime; frameNumber = sample + 1
+      --rdly N         the image description carries 'rdly' = N
+      --no-lib         AVCDecLib cannot be found
+      --fake-version V AVCDecLib reports version V (hex)
+      --sync-signext   negative syncFrameTime starts with hi = -1 (default: hi = 0,
+                       lo = the negative value, as QuickTime 6 was measured to pass)
+      --fresh-dst      fill the destination with 0xAB before EVERY call (v16
+                       behaviour). Default since v17: filled once, then it keeps
+                       its contents between calls, like QuickTime's buffers.
+      --swap-dst K     every K calls QuickTime hands over the OTHER of two
+                       destination buffers (each keeps its own contents)
+      --fail-every K   every K-th avcdec_decode_sample reports an error (-1) after
+                       decoding (its picture, if any, is never shown)
+      --exact-buffers  hand each sample over in its own malloc block of exactly its
+                       size (AddressSanitizer then sees any read past the end)
 */
 
 #define H264_HOST_BUILD 1
 
 #include "host_mac.h"
+#include <math.h>
 
 #include "basetype.h"
 #include "h264bsd_decoder.h"
@@ -64,6 +86,7 @@ static FILE *gOut, *gIndex;
 static long  gPicsThisCall, gPicsTotal;
 static long  gCurCall, gCurSample;
 static int   gDeblockOffNow;
+static unsigned char *gHostNoDeblock;   /* v17: &glob->noDeblock, read when a picture comes out */
 static u8   *gIsKey;          /* per sample: contains an IDR slice */
 static int   gTainted;        /* a picture since the last key frame was not deblocked */
 /* --sim: the simulated clock. Each picture charges its decode time and
@@ -95,6 +118,114 @@ static u8 *Harness_NextOutputPicture(storage_t *s, u32 *id, u32 *idr, u32 *err)
     return pic;
 }
 #define h264bsdNextOutputPicture Harness_NextOutputPicture
+
+/* ---- v16t: AVCDecLib backend -- capture every picture it hands over ---- */
+#if defined(H264_BACKEND_AVCDEC) && H264_BACKEND_AVCDEC
+#include "AVCDecAPI.h"
+long avcdec_decode_sample(AVCDecContext *, const unsigned char *, long, AVCDecPicture *);
+/* v17: after every library call the ONLY picture the component may read
+   is the one that call returned. Under AddressSanitizer every other
+   picture the library has ever returned is poisoned until the next
+   library call (which unpoisons them all first: FFmpeg itself reads
+   them as references), so any read of a stale picture is reported. */
+#if defined(__SANITIZE_ADDRESS__)
+#include <sanitizer/asan_interface.h>
+#define HP_ON 1
+#else
+#define HP_ON 0
+#endif
+typedef struct { const unsigned char *p[3]; long n[3]; } HPRegion;
+static HPRegion gHP[64]; static int gHPCount;
+static AVCDecPicture gHPKeep; static int gHPKeepValid;   /* the picture the last picture call returned */
+static long gFailEvery, gDecodeCalls;
+static void HP_Unpoison(void)
+{
+#if HP_ON
+    int i, k;
+    for (i = 0; i < gHPCount; i++) for (k = 0; k < 3; k++) ASAN_UNPOISON_MEMORY_REGION(gHP[i].p[k], (size_t)gHP[i].n[k]);
+#endif
+}
+static void HP_After(const AVCDecPicture *keep)   /* keep: the picture this call returned, or 0 */
+{
+    if (keep != &gHPKeep) { gHPKeepValid = keep != NULL; if (keep) gHPKeep = *keep; }
+#if HP_ON
+    int i, k, found = -1;
+    if (keep != NULL)
+    {
+        for (i = 0; i < gHPCount; i++) if (gHP[i].p[0] == keep->plane[0]) found = i;
+        if (found < 0 && gHPCount < 64) found = gHPCount++;
+        if (found >= 0)
+            for (k = 0; k < 3; k++)
+            {
+                long h = keep->height >> (k ? 1 : 0), w = keep->width >> (k ? 1 : 0);
+                gHP[found].p[k] = keep->plane[k];
+                gHP[found].n[k] = (h - 1) * keep->stride[k] + w;
+            }
+    }
+    for (i = 0; i < gHPCount; i++)
+        if (keep == NULL || gHP[i].p[0] != keep->plane[0])
+            for (k = 0; k < 3; k++) ASAN_POISON_MEMORY_REGION(gHP[i].p[k], (size_t)gHP[i].n[k]);
+#else
+    (void)keep;
+#endif
+}
+long avcdec_take_lowest(AVCDecContext *, AVCDecPicture *, long *);
+long avcdec_peek_lowest(AVCDecContext *, AVCDecPicture *, long *);
+long avcdec_set_skip(AVCDecContext *, long, long);
+long avcdec_get_delay(AVCDecContext *);
+long avcdec_set_delay(AVCDecContext *, long);
+long avcdec_held(AVCDecContext *);
+unsigned long avcdec_version(void);
+long avcdec_init(const AVCDecCallbacks *, unsigned long, unsigned long *);
+AVCDecContext *avcdec_open(const unsigned char *, long);
+long avcdec_feed_annexb(AVCDecContext *, const unsigned char *, long, long *, AVCDecPicture *);
+long avcdec_flush(AVCDecContext *, AVCDecPicture *);
+void avcdec_reset(AVCDecContext *);
+void avcdec_close(AVCDecContext *);
+static long Harness_take_lowest(AVCDecContext *c, AVCDecPicture *p, long *poc)
+{ long r; HP_Unpoison(); r = avcdec_take_lowest(c, p, poc); HP_After(r == 1 ? p : NULL); return r; }
+static long Harness_peek_lowest(AVCDecContext *c, AVCDecPicture *p, long *poc)
+{ long r; HP_Unpoison(); r = avcdec_peek_lowest(c, p, poc); HP_After(r == 1 ? p : NULL); return r; }
+/* v17c: queries (they touch no picture): the picture the last picture call
+   returned stays readable across them, everything else stays poisoned. */
+#define HP_KEEP (gHPKeepValid ? &gHPKeep : NULL)
+static long Harness_set_skip(AVCDecContext *c, long a, long b) { long r; HP_Unpoison(); r = avcdec_set_skip(c, a, b); HP_After(HP_KEEP); return r; }
+static long Harness_get_delay(AVCDecContext *c) { long r; HP_Unpoison(); r = avcdec_get_delay(c); HP_After(HP_KEEP); return r; }
+static long Harness_set_delay(AVCDecContext *c, long n) { long r; HP_Unpoison(); r = avcdec_set_delay(c, n); HP_After(HP_KEEP); return r; }
+static long Harness_held(AVCDecContext *c) { long r; HP_Unpoison(); r = avcdec_held(c); HP_After(HP_KEEP); return r; }
+static unsigned long Harness_version(void) { return avcdec_version(); }
+static long Harness_init(const AVCDecCallbacks *cb, unsigned long f, unsigned long *sp) { return avcdec_init(cb, f, sp); }
+static AVCDecContext *Harness_open(const unsigned char *a, long n) { AVCDecContext *r; HP_Unpoison(); r = avcdec_open(a, n); HP_After(NULL); return r; }
+static long Harness_feed_annexb(AVCDecContext *c, const unsigned char *d, long n, long *u, AVCDecPicture *p) { return avcdec_feed_annexb(c, d, n, u, p); }
+static long Harness_flush(AVCDecContext *c, AVCDecPicture *p) { long r; HP_Unpoison(); r = avcdec_flush(c, p); HP_After(r == 1 ? p : NULL); return r; }
+static void Harness_reset(AVCDecContext *c) { HP_Unpoison(); avcdec_reset(c); HP_After(NULL); }
+static void Harness_close(AVCDecContext *c) { HP_Unpoison(); gHPCount = 0; avcdec_close(c); }
+#define H264_HOST_AVC_WRAP(n) Harness_##n
+static long Harness_avc_decode(AVCDecContext *c, const unsigned char *d, long n, AVCDecPicture *p)
+{
+    long r;
+    HP_Unpoison();
+    r = avcdec_decode_sample(c, d, n, p);
+    gDecodeCalls++;
+    if (gFailEvery > 0 && gDecodeCalls % gFailEvery == 0) r = -1;   /* --fail-every */
+    if (r > 0)
+    {
+        long y, k;
+        for (k = 0; k < 3; k++)
+        {
+            long w = p->width >> (k ? 1 : 0), h = p->height >> (k ? 1 : 0);
+            for (y = 0; y < h; y++) fwrite(p->plane[k] + y * p->stride[k], 1, (size_t)w, gOut);
+        }
+        if (gSim) gFakeClock += (UInt32)gSimDecodeUs;
+        if (gIndex) { int nd = gHostNoDeblock ? *gHostNoDeblock : 0; fprintf(gIndex, "%ld %ld %d %d\n", gCurCall, gCurSample, nd, nd); }
+        gPicsThisCall++;
+        gPicsTotal++;
+    }
+    HP_After(r > 0 ? p : NULL);
+    return r;
+}
+#define H264_HOST_AVC_DECODE Harness_avc_decode
+#endif
 
 /* gcc has no "\p" Pascal strings: spell the length byte (16) out. */
 #define kLogFallbackName ((ConstStr255Param)"\020H264 Decoder Log")
@@ -148,6 +279,8 @@ int main(int argc, char **argv)
     u8 *dstBuf; long dstRowBytes, dstBpp; int dstFmt;   /* 0 2vuy 1 rgb32 2 rgb16 3 y420 */
     PlanarPixmapInfoYUV420 *ppi = NULL;
     u8 *scratchSample;
+    double *tStart = NULL, *tDur = NULL; long tScale = 30000; int noSync = 0;
+    long *qtFlags = NULL; const char *timesName = NULL; int exactBuf = 0, freshDst = 0, syncSignExt = 0; long swapDst = 0; u8 *dstBufs[2]; u8 *exactBlock = NULL;
 
     if (argc < 3) { fprintf(stderr, "usage: %s SAMPLES OUT.yuv [options] (see the top of decode_run.c)\n", argv[0]); return 2; }
     for (a = 3; a < argc; a++)
@@ -166,6 +299,16 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[a], "--qt-frametime")) qtFrameTime = 1;
         else if (!strcmp(argv[a], "--keep-going")) keepGoing = 1;
         else if (!strcmp(argv[a], "--prebuf-first")) preBufFirst = 1;
+        else if (!strcmp(argv[a], "--times") && a + 1 < argc) timesName = argv[++a];
+        else if (!strcmp(argv[a], "--no-synctime")) noSync = 1;
+        else if (!strcmp(argv[a], "--exact-buffers")) exactBuf = 1;
+        else if (!strcmp(argv[a], "--fresh-dst")) freshDst = 1;
+        else if (!strcmp(argv[a], "--sync-signext")) syncSignExt = 1;
+        else if (!strcmp(argv[a], "--swap-dst") && a + 1 < argc) swapDst = atol(argv[++a]);
+        else if (!strcmp(argv[a], "--fail-every") && a + 1 < argc) gFailEvery = atol(argv[++a]);
+        else if (!strcmp(argv[a], "--rdly") && a + 1 < argc) gHostRdly = atol(argv[++a]);
+        else if (!strcmp(argv[a], "--no-lib")) gHostAvcMissing = 1;
+        else if (!strcmp(argv[a], "--fake-version") && a + 1 < argc) gHostAvcFakeVersion = strtoul(argv[++a], NULL, 16);
         else if (!strcmp(argv[a], "--catchup") && a + 1 < argc) catchUpPermille = atoi(argv[++a]);
         else if (!strcmp(argv[a], "--seek-at") && a + 2 < argc) { seekAt = atoi(argv[++a]); seekBack = atoi(argv[++a]); }
         else { fprintf(stderr, "unknown option %s\n", argv[a]); return 2; }
@@ -201,6 +344,18 @@ int main(int argc, char **argv)
         }
     }
     scratchSample = (u8 *)malloc(maxSample + 16);
+    tStart = (double *)malloc(count * sizeof(double)); tDur = (double *)malloc(count * sizeof(double));
+    for (i = 0; i < count; i++) { tStart[i] = (double)i * 1001.0; tDur[i] = 1001.0; }
+    if (timesName)
+    {
+        FILE *tf = fopen(timesName, "r");
+        double st0, du0; long sc0;
+        if (!tf) { perror(timesName); return 2; }
+        for (i = 0; i < count && fscanf(tf, "%lf %lf %ld", &st0, &du0, &sc0) == 3; i++)
+        { tStart[i] = st0; tDur[i] = du0; tScale = sc0; }
+        fclose(tf);
+        if (i != count) { fprintf(stderr, "times: %lu lines for %lu samples\n", (unsigned long)i, (unsigned long)count); return 2; }
+    }
     gIsKey = isKey;
 
     gOut = fopen(argv[2], "wb");
@@ -250,12 +405,17 @@ int main(int argc, char **argv)
         ppi->componentInfoCr.offset = 64 + PM_W * PM_H * 5 / 4;   ppi->componentInfoCr.rowBytes = PM_W / 2;
     }
     p.dstPixMap.baseAddr = (Ptr)dstBuf;
+    dstBufs[0] = dstBuf;
+    dstBufs[1] = (u8 *)malloc((size_t)PM_W * 4 * PM_H + 64);
+    memcpy(dstBufs[1], dstBufs[0], 64);                       /* the planar header */
+    memset(dstBufs[1] + 64, 0xAB, (size_t)PM_W * 4 * PM_H);
     p.dstPixMap.rowBytes = (short)(0x8000 | dstRowBytes);
 
     /* ---- Open and PreDecompress, as QuickTime calls them ---- */
     gHostAvcC = avcC; gHostAvcCSize = (long)avcCSize;
     if (H264CodecOpen(NULL, NULL) != noErr) { fprintf(stderr, "Open failed\n"); return 1; }
     glob = (H264GlobalsPtr)gHostInstanceStorage;
+    gHostNoDeblock = (unsigned char *)&glob->noDeblock;
     rc = H264CodecPreDecompress(glob, &p);
     if (rc != noErr && keepGoing)
         fprintf(stderr, "[harness] PreDecompress returned %d; calling BandDecompress anyway (--keep-going)\n", (int)rc);
@@ -267,7 +427,23 @@ int main(int argc, char **argv)
         return gHostLiveBlocks == 0 ? 0 : 1;
     }
 
-    if (strncmp(mode, "list:", 5) == 0)
+    if (strncmp(mode, "qt:", 3) == 0)
+    {
+        FILE *lf = fopen(mode + 3, "r");
+        unsigned long v; long fl;
+        u32 cap = 1024;
+        if (!lf) { perror(mode + 3); return 2; }
+        schedule = (u32 *)malloc(cap * sizeof(u32)); qtFlags = (long *)malloc(cap * sizeof(long));
+        while (fscanf(lf, "%lu %ld", &v, &fl) == 2)
+        {
+            if (v >= count) { fprintf(stderr, "sample %lu out of range\n", v); return 2; }
+            if (nSchedule == cap) { cap *= 2; schedule = (u32 *)realloc(schedule, cap * sizeof(u32)); qtFlags = (long *)realloc(qtFlags, cap * sizeof(long)); }
+            qtFlags[nSchedule] = fl;
+            schedule[nSchedule++] = (u32)v;
+        }
+        fclose(lf);
+    }
+    else if (strncmp(mode, "list:", 5) == 0)
     {
         FILE *lf = fopen(mode + 5, "r");
         unsigned long v;
@@ -326,10 +502,25 @@ int main(int argc, char **argv)
 
             p.conditionFlags = (catchUpPermille > 0 && (int)(Rand() % 1000) < catchUpPermille) ?
                                (int)codecConditionCatchUpDiff : 0;
+            if (exactBuf) { exactBlock = (u8 *)malloc(size); memcpy(exactBlock, data, size); data = exactBlock; }
             p.data = (Ptr)data;
             p.bufferSize = (int)size;
             p.frameNumber = (int)s;
             gPicsThisCall = 0; gCurCall = (long)i; gCurSample = (long)s;
+            if (qtFlags != NULL) p.conditionFlags |= (int)qtFlags[i];
+            /* v17: QuickTime 6 passes syncFrameTime (the sample's start
+               time, scale, duration) on every call; --sim overrides it. */
+            if (noSync) { p.syncFrameTime = NULL; p.frameNumber = (int)s + 1; }
+            else
+            {
+                /* v17c: as QuickTime 6 passes them (guest run b21): a negative
+                   start comes as hi = 0, lo = the negative value; --sync-signext
+                   gives the textbook form (hi = -1) instead. */
+                long st0 = (long)floor(tStart[s] + 0.5);
+                sft.startTime.hi = (syncSignExt && st0 < 0) ? -1 : 0; sft.startTime.lo = (UInt32)st0;
+                sft.scale = (int)tScale; sft.duration = (int)(tDur[s] + 0.5);
+                p.syncFrameTime = &sft;
+            }
 
             if (sim)
             {
@@ -358,12 +549,19 @@ int main(int argc, char **argv)
                 t = start;
             }
 
-            if (dstOut != NULL) memset(dstBuf + (dstFmt == 3 ? 64 : 0), 0xAB, (size_t)PM_W * 4 * PM_H);  /* "not painted" */
+            if (swapDst > 0 && i > 0 && i % swapDst == 0)
+            {
+                dstBuf = (dstBuf == dstBufs[0]) ? dstBufs[1] : dstBufs[0];
+                if (dstFmt == 3) ppi = (PlanarPixmapInfoYUV420 *)dstBuf;
+                p.dstPixMap.baseAddr = (Ptr)dstBuf;
+            }
+            if (dstOut != NULL && (freshDst || i == 0)) memset(dstBuf + (dstFmt == 3 ? 64 : 0), 0xAB, (size_t)PM_W * 4 * PM_H);  /* "not painted" */
             blitsBefore = glob->statBlitY420 + glob->statBlit2vuy + glob->statBlitRGB32 + glob->statBlitRGB16;
             picsBefore  = glob->picsOut;
             gDeblockOffNow = glob->noDeblock;
 
             rc = H264CodecBandDecompress(glob, &p);
+            if (exactBlock != NULL) { free(exactBlock); exactBlock = NULL; }
 
             if (sim)
             {
@@ -434,6 +632,17 @@ int main(int argc, char **argv)
         if (dstOut != NULL) fclose(dstOut);
         if (gIndex) fclose(gIndex);
         fileCalls = gHostFileCalls; clockReads = gHostClockReads;
+#if defined(H264_BACKEND_AVCDEC) && H264_BACKEND_AVCDEC && defined(kAvPad)
+        printf("v17 delay %ld resets %lu nokey-jumps %lu gated %lu tail %lu key-repeats %lu held %lu unsupported %d deblock-offs %lu",
+               glob->avDelay, glob->statResets, glob->statJumpsNoKey, glob->statGated, glob->statTail,
+               glob->statIdrRepeats, glob->statHeld, (int)glob->unsupportedStream, glob->statDeblockOffs);
+#ifdef H264_AV
+        printf(" stale-hidden %lu kept %lu dst-changed %lu black-repaints %lu repeats %lu decode-errors %lu rdly-takes %lu rdly-lost %lu",
+               glob->statStaleHidden, glob->statKept, glob->statDstChanged, glob->statBlackRepaints, glob->statRepeats, glob->statDecodeErrors, glob->statRdlyTakes, glob->statRdlyLost);
+        printf(" queue-at-end %ld", (glob->av.held != NULL && glob->avc != NULL) ? glob->av.held(glob->avc) : -1L);
+#endif
+        printf("\n");
+#endif
         H264CodecClose(glob, NULL);
         printf("%s calls %lu pictures %ld firstpic %ld nopic %ld rc-errors %ld decode-errors %lu | "
                "mem: ptr %ld temp %ld peak %ld bytes, live after Close %ld | file-calls %ld clock-reads %ld | stray-bytes %ld\n",

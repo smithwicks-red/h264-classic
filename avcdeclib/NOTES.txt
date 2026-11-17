@@ -1,0 +1,13 @@
+AVCDecLib (stage 3, session e20/b20). FFmpeg tag: n0.8.15 (release 0.8.15, from ffmpeg-old/; VERSION=0.8.15).
+Patched tree = ff/ (full 0.8.15 tree + patches/ffmpeg-0.8.15-avcdeclib.diff). LGPL 2.1+ config (CONFIG_GPL 0).
+Build: ./build.sh linux && ./linkl.sh && ./runl.sh [annexb|avcc]   (ppc-linux, qemu-ppc: C on -cpu 750, AltiVec on 7450)
+       ./build.sh mac && ./linkm.sh   -> AVCDecLib.pef / AVCDecLib.bin (MacBinary shlb 'AVCd' with cfrg)
+Toolchain: Retro68 GCC 16.1 (r68build/toolchain), MakePEF patched (patches/MakePEF_d20.diff: export hash + 16-byte sections).
+libgcc members linked: lg/_divdi3.o _moddi3.o _fixdfdi.o _fixunsdfdi.o _floatdidf.o (extracted from libgcc.a).
+cfg/config.h = ppc-linux configure output (bppc_av) with DCBZL/MALLOC_H/MEMALIGN/POSIX_MEMALIGN/ISATTY/RUNTIME_CPUDETECT off.
+Replaced FFmpeg files (not built): libavutil/log.c, libavutil/eval.c, libavutil/ppc/cpu.c -> src/avd_shim.c, src/avd_libc.c.
+Guest: guest/AVCDecTest.c (= SpikeTest.c in the CW project folder Macintosh HD:avcspike:avcdec:), guest/project/ (.mcp, app, log).
+b21a (r2, 0x00080F02): patches/ffmpeg-0.8.15-sps-leak.diff (SPS freed on log2_max_frame_num error path),
+ patches/avcdeclib-r2-api.diff (+set_skip get_delay set_delay take_lowest held peek_lowest = 14 exports,
+ AVCDecPicture.poc appended), patches/MakePEF_b21_mainsection.diff (no entry -> mainSection -1 / mainOffset 0).
+ build.sh needs ALTIH=/home/claude/stage3/Retro68/gcc/gcc/config/rs6000/altivec.h (gcc-16.1.0 tag; rs6000-vecdefines.h comes from the toolchain).

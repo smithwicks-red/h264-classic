@@ -1,0 +1,14 @@
+avcdec_version
+avcdec_init
+avcdec_open
+avcdec_feed_annexb
+avcdec_decode_sample
+avcdec_flush
+avcdec_reset
+avcdec_close
+avcdec_set_skip
+avcdec_get_delay
+avcdec_set_delay
+avcdec_take_lowest
+avcdec_held
+avcdec_peek_lowest

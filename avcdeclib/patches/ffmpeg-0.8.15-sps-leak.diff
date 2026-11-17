@@ -1,0 +1,10 @@
+--- a/libavcodec/h264_ps.c
++++ b/libavcodec/h264_ps.c
+@@ -376,6 +376,7 @@
+         av_log(h->s.avctx, AV_LOG_ERROR,
+                "log2_max_frame_num_minus4 out of range (0-12): %d\n",
+                log2_max_frame_num_minus4);
++        av_free(sps);
+         return AVERROR_INVALIDDATA;
+     }
+     sps->log2_max_frame_num = log2_max_frame_num_minus4 + 4;

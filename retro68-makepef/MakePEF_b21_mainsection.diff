@@ -1,0 +1,17 @@
+--- a/PEFTools/MakePEF.cc
++++ b/PEFTools/MakePEF.cc
+@@ -454,8 +454,12 @@
+     loaderInfoHeader.initSection = -1;
+     loaderInfoHeader.termSection = -1;
+ 
+-    loaderInfoHeader.mainSection = 1;
+-    loaderInfoHeader.mainOffset = get(aoutHeader.entry);
++    /* b21: only declare a main symbol if the XCOFF has an entry point (o_entry != -1).
++       Apple PEFBinaryFormat.h: mainSection "-1 => none"; offset left 0 (like init/term). */
++    if ((uint32_t)get(aoutHeader.entry) != 0xFFFFFFFFu) {
++        loaderInfoHeader.mainSection = 1;
++        loaderInfoHeader.mainOffset = get(aoutHeader.entry);
++    }
+ 
+ 
+     PEFSectionHeader textSectionHeader, dataSectionHeader, loaderSectionHeader;

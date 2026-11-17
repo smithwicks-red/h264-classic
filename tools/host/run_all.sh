@@ -26,6 +26,14 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 OLD=$HERE/../decode_run
 DW=${DW:-360}; DH=${DH:-240}
 CWID=$(( (DW + 15) / 16 * 16 )); CHGT=$(( (DH + 15) / 16 * 16 ))
+# v16t: AVCDEC=1 tests the AVCDecLib backend. Pictures are captured
+# cropped, so they are compared at the display size. AVCLIB_X / AVCLIB_PPC
+# are AVCDecLib's objects linked as one relocatable (native / ppc-linux).
+AVX=""; LIBX=""; LIBP=""
+if [ "${AVCDEC:-0}" = 1 ]; then
+    AVX="-DH264_BACKEND_AVCDEC=1"; LIBX=${AVCLIB_X:?}; LIBP=${AVCLIB_PPC:?}
+    CWID=$DW; CHGT=$DH
+fi
 mkdir -p "$W"; cd "$W"
 FAIL=0
 ok()  { echo "PASS  $*"; }
@@ -38,10 +46,10 @@ run() { # label, command...
 python3 "$OLD/extract_samples.py" "$MOVIE" movie.samples > /dev/null
 ffmpeg -v error -y -i "$MOVIE" -f rawvideo -pix_fmt yuv420p ffmpeg.yuv
 
-sh "$HERE/build.sh" ./dr gcc || { bad "build (gcc)"; exit 1; }
+sh "$HERE/build.sh" ./dr gcc $AVX $LIBX || { bad "build (gcc)"; exit 1; }
 BINS="./dr"
 if command -v powerpc-linux-gnu-gcc > /dev/null && command -v qemu-ppc > /dev/null; then
-    sh "$HERE/build.sh" ./dr_ppc powerpc-linux-gnu-gcc && BINS="./dr qemu-ppc:./dr_ppc"
+    sh "$HERE/build.sh" ./dr_ppc powerpc-linux-gnu-gcc $AVX $LIBP && BINS="./dr qemu-ppc:./dr_ppc"
 else
     echo "NOTE  no PowerPC cross-compiler / qemu-ppc: big-endian leg skipped"
 fi
@@ -50,7 +58,11 @@ for B in $BINS; do
     X=$(echo "$B" | tr ':' ' ')
     for m in seq poster twice; do
         run "[$B] $m" $X movie.samples o.yuv --size $DW $DH --mode $m
+        cp run.out $m.out
         run "[$B] $m pictures vs ffmpeg" python3 "$HERE/check.py" pics o.yuv ffmpeg.yuv $CWID $CHGT $DW $DH
+        if [ -n "$AVX" ] && [ $m = seq ]; then
+            run "[$B] seq: one picture per sample, on the call that decodes it" sh -c "grep -q 'nopic 0 ' seq.out && grep -q \"pictures \$(python3 -c 'import struct,sys;d=open(sys.argv[1],\"rb\").read();a=struct.unpack(\">I\",d[:4])[0];print(struct.unpack(\">I\",d[4+a:8+a])[0])' movie.samples) \" seq.out && tail -1 seq.out"
+        fi
     done
     for fmt in 2vuy rgb32 rgb16 y420; do
         for clip in "$DW $DH" "$((DW-1)) $((DH-1))"; do
@@ -65,7 +77,7 @@ for B in $BINS; do
     run "[$B] ... pictures vs ffmpeg" python3 "$HERE/check.py" pics o.yuv ffmpeg.yuv $CWID $CHGT $DW $DH
 done
 
-if sh "$HERE/build.sh" ./dr_asan gcc -fsanitize=address,undefined -fno-omit-frame-pointer -g 2> /dev/null; then
+if sh "$HERE/build.sh" ./dr_asan gcc -fsanitize=address,undefined -fno-omit-frame-pointer -g $AVX $LIBX 2> /dev/null; then
     for seed in 1 2 3; do for pm in 20 400; do
         ASAN_OPTIONS=detect_leaks=0 ./dr_asan movie.samples o.yuv --size $DW $DH --corrupt $seed $pm --dst rgb32 --dst-out d.bin > run.out 2> run.err
         if [ $? -eq 0 ] && ! grep -q "ERROR\|runtime error" run.err && grep -q "rc-errors 0" run.out

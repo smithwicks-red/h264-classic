@@ -107,8 +107,16 @@ def main():
                'y420': CW * CH + 2 * (CW // 2) * (CH // 2)}[fmt]
         dst = np.fromfile(sys.argv[2], np.uint8).reshape(-1, per)
         exact = unpainted = 0; first = None
+        # v17: MODE map:FILE = one frame index per call, -1 = black (Y 16, Cb/Cr 128)
+        cmap = [int(l.split()[0]) for l in open(mode[4:])] if mode.startswith('map:') else None
+        fs = DW * DH * 3 // 2
+        if cmap is not None:
+            blk = np.concatenate([np.full(DW * DH, 16, np.uint8), np.full(fs - DW * DH, 128, np.uint8)])
+            ref = np.concatenate([ref[:(len(ref) // fs) * fs], blk])
+            nblack = len(ref) // fs - 1
         for i in range(len(dst)):
             k = 0 if mode == 'poster' else (max(i - 1, 0) if mode == 'twice' else i)
+            if cmap is not None: k = cmap[i] if cmap[i] >= 0 else nblack
             d = dst[i]
             if np.all(d == 0xAB):
                 unpainted += 1; first = first or (i, 'unpainted'); continue

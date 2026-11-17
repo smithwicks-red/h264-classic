@@ -1,0 +1,205 @@
+--- a/src/avcdec.c	2026-11-14 22:40:06.832221161 +0000
++++ b/src/avcdec.c	2026-11-15 20:24:10.830692442 +0000
+@@ -3,6 +3,8 @@
+ #include "libavcodec/avcodec.h"
+ #include "libavutil/cpu.h"
+ #include "libavutil/mem.h"
++#include "libavcodec/h264.h"
++#include <limits.h>
+ #include "avcdec.h"
+ #include "avd_shim.h"
+ 
+@@ -19,7 +21,7 @@
+ 
+ static int registered;
+ 
+-unsigned long avcdec_version(void) { return 0x00080F01UL; }
++unsigned long avcdec_version(void) { return 0x00080F02UL; }
+ 
+ long avcdec_init(const AVCDecCallbacks *cb, unsigned long flags, unsigned long *sp_mod16)
+ {
+@@ -62,6 +64,17 @@
+     return NULL;
+ }
+ 
++/* POC of the picture in c->frame: the decoder's Picture that owns the same buffer. */
++static long frame_poc(AVCDecContext *c)
++{
++    H264Context *h = c->avctx->priv_data;
++    int i;
++    if (h && h->s.picture && c->frame->data[0])
++        for (i = 0; i < h->s.picture_count; i++)
++            if (h->s.picture[i].data[0] == c->frame->data[0]) return h->s.picture[i].poc;
++    return LONG_MIN;
++}
++
+ static void fill(AVCDecContext *c, AVCDecPicture *pic)
+ {
+     int i;
+@@ -70,6 +83,7 @@
+     pic->height = c->avctx->height;
+     pic->key = c->frame->key_frame;
+     pic->count = ++c->count;
++    pic->poc = frame_poc(c);
+ }
+ 
+ static long decode(AVCDecContext *c, const unsigned char *d, long n, AVCDecPicture *pic)
+@@ -139,3 +153,88 @@
+     av_free(c->frame);
+     av_free(c);
+ }
++
++/* skip_loop_filter / skip_frame: 0 = default (nothing skipped), 1 = non-reference only,
++   2 = all (skip_frame: 2 = everything except key frames). Returns 0, <0 on bad args. */
++long avcdec_set_skip(AVCDecContext *c, long skip_loop_filter, long skip_frame)
++{
++    static const signed char lf[3] = { AVDISCARD_DEFAULT, AVDISCARD_NONREF, AVDISCARD_ALL };
++    static const signed char fr[3] = { AVDISCARD_DEFAULT, AVDISCARD_NONREF, AVDISCARD_NONKEY };
++    if (!c || !c->avctx) return -1;
++    if (skip_loop_filter < 0 || skip_loop_filter > 2 || skip_frame < 0 || skip_frame > 2) return -2;
++    c->avctx->skip_loop_filter = lf[skip_loop_filter];
++    c->avctx->skip_frame = fr[skip_frame];
++    return 0;
++}
++
++/* Current reorder delay in pictures (avctx->has_b_frames); valid once parameter sets are parsed. */
++long avcdec_get_delay(AVCDecContext *c)
++{
++    if (!c || !c->avctx) return -1;
++    return c->avctx->has_b_frames;
++}
++
++/* Force the reorder delay to n pictures (0..MAX_DELAYED_PIC_COUNT). FFmpeg may still raise it
++   (SPS num_reorder_frames, out-of-order detection); it never lowers it. Returns 0, <0 on bad args. */
++long avcdec_set_delay(AVCDecContext *c, long n)
++{
++    H264Context *h;
++    if (!c || !c->avctx) return -1;
++    if (n < 0 || n > MAX_DELAYED_PIC_COUNT) return -2;
++    h = c->avctx->priv_data;
++    c->avctx->has_b_frames = (int)n;
++    h->s.low_delay = n ? 0 : 1;
++    return 0;
++}
++
++/* Remove and return the lowest-POC held picture (FFmpeg's own choice rule, including the
++   key-frame / mmco_reset barrier) and release FFmpeg's delay hold on it. 1 = *pic filled,
++   0 = nothing held, -1 = bad args. *poc (optional) = its POC (also in pic->poc). */
++long avcdec_take_lowest(AVCDecContext *c, AVCDecPicture *pic, long *poc)
++{
++    H264Context *h; Picture *out; int i, out_idx = 0;
++    if (!c || !c->avctx || !pic) return -1;
++    h = c->avctx->priv_data;
++    out = h->delayed_pic[0];
++    if (!out) return 0;
++    for (i = 1; h->delayed_pic[i] && !h->delayed_pic[i]->key_frame && !h->delayed_pic[i]->mmco_reset; i++)
++        if (h->delayed_pic[i]->poc < out->poc) { out = h->delayed_pic[i]; out_idx = i; }
++    for (i = out_idx; h->delayed_pic[i]; i++) h->delayed_pic[i] = h->delayed_pic[i + 1];
++    out->reference &= ~DELAYED_PIC_REF;
++    h->next_outputed_poc = INT_MIN;   /* caller now orders; FFmpeg must not drop the next as out-of-order */
++    *c->frame = *(AVFrame *)out;
++    fill(c, pic);
++    pic->poc = out->poc;
++    if (poc) *poc = out->poc;
++    return 1;
++}
++
++/* Like avcdec_take_lowest (same selection rule) but leaves the picture in FFmpeg's queue: no
++   removal, DELAYED_PIC_REF and next_outputed_poc untouched, pic->count not advanced (it repeats
++   the count of the last output picture). 1 = *pic filled, 0 = none held, -1 = bad args. */
++long avcdec_peek_lowest(AVCDecContext *c, AVCDecPicture *pic, long *poc)
++{
++    H264Context *h; Picture *out; int i;
++    if (!c || !c->avctx || !pic) return -1;
++    h = c->avctx->priv_data;
++    out = h->delayed_pic[0];
++    if (!out) return 0;
++    for (i = 1; h->delayed_pic[i] && !h->delayed_pic[i]->key_frame && !h->delayed_pic[i]->mmco_reset; i++)
++        if (h->delayed_pic[i]->poc < out->poc) out = h->delayed_pic[i];
++    *c->frame = *(AVFrame *)out;
++    fill(c, pic);
++    pic->count = --c->count;
++    pic->poc = out->poc;
++    if (poc) *poc = out->poc;
++    return 1;
++}
++
++/* Number of pictures currently held in FFmpeg's reorder queue; -1 if c is 0. */
++long avcdec_held(AVCDecContext *c)
++{
++    H264Context *h; long n = 0;
++    if (!c || !c->avctx) return -1;
++    h = c->avctx->priv_data;
++    while (n <= MAX_DELAYED_PIC_COUNT && h->delayed_pic[n]) n++;
++    return n;
++}
+--- a/src/avcdec.h	2026-11-14 22:40:06.832245051 +0000
++++ b/src/avcdec.h	2026-11-15 20:24:10.831138320 +0000
+@@ -25,6 +25,12 @@
+     long  width, height;           /* cropped luma size; chroma is width/2 x height/2 */
+     long  key;                     /* 1 if key frame */
+     long  count;                   /* pictures output so far on this context (1-based) */
++    long  poc;                     /* Since 0x00080F02: picture order count of this picture (frame POC).
++                                      Appended at the END, so every older field keeps its offset and old
++                                      callers' reads are unchanged. NOTE: the library writes this field on
++                                      every returned picture, so a caller compiled with the old 9-long
++                                      struct must give room for it (allocate sizeof of this struct) before
++                                      running against 0x00080F02 or later. */
+ } AVCDecPicture;
+ 
+ typedef struct AVCDecContext AVCDecContext;
+@@ -47,6 +53,31 @@
+ /* Discard all decoder/parser state (seek). Next input should start at an IDR/recovery point. */
+ void avcdec_reset(AVCDecContext *c);
+ void avcdec_close(AVCDecContext *c);
++/* Since build 0x00080F02. Decode-speed controls; take effect from the next decoded picture.
++   skip_loop_filter: 0 = none skipped (default), 1 = deblocking skipped on non-reference pictures, 2 = on all.
++   skip_frame:       0 = none skipped (default), 1 = non-reference pictures dropped (not decoded, not output),
++                     2 = additionally only I slices decoded: FFmpeg 0.8 still OUTPUTS the other reference pictures,
++                         undecoded (stale content). Use 2 only together with your own non-key frame dropping.
++   Returns 0, or <0 on bad args. */
++long avcdec_set_skip(AVCDecContext *c, long skip_loop_filter, long skip_frame);
++/* Since build 0x00080F02. Current reorder delay in pictures (FFmpeg has_b_frames), valid once the
++   parameter sets are parsed (after avcdec_open with avcC, or after the first decode); may grow
++   during decoding. Returns -1 if c is 0. */
++long avcdec_get_delay(AVCDecContext *c);
++/* Since build 0x00080F02. Force the reorder delay to n pictures (0..16). FFmpeg may raise it again
++   (SPS num_reorder_frames, out-of-order detection) but never lowers it. Returns 0, <0 on bad args. */
++long avcdec_set_delay(AVCDecContext *c, long n);
++/* Since build 0x00080F02. Remove the lowest-POC picture FFmpeg is holding for reordering (same rule as
++   FFmpeg's own output, stops at a key frame) and return it: 1 = *pic filled, 0 = none held, <0 bad args.
++   *poc (may be 0) receives its POC. Pointers valid until the next call on c. Use instead of
++   avcdec_flush to drain, or to output early. */
++long avcdec_take_lowest(AVCDecContext *c, AVCDecPicture *pic, long *poc);
++/* Since build 0x00080F02. Same choice as avcdec_take_lowest but the picture STAYS queued and FFmpeg's
++   reordering state is not touched (e.g. paint the first picture at once after a seek). pic->count is
++   not advanced. Returns 1 = *pic filled, 0 = none held, <0 bad args. Pointers valid until next call. */
++long avcdec_peek_lowest(AVCDecContext *c, AVCDecPicture *pic, long *poc);
++/* Since build 0x00080F02. Pictures currently held in the reorder queue; -1 if c is 0. */
++long avcdec_held(AVCDecContext *c);
+ 
+ #ifdef __cplusplus
+ }
+--- a/src/avcdec.exp	2026-11-14 22:40:06.832256952 +0000
++++ b/src/avcdec.exp	2026-11-15 20:24:10.831138320 +0000
+@@ -6,3 +6,9 @@
+ avcdec_flush
+ avcdec_reset
+ avcdec_close
++avcdec_set_skip
++avcdec_get_delay
++avcdec_set_delay
++avcdec_take_lowest
++avcdec_held
++avcdec_peek_lowest
+--- a/linkl.sh	2026-11-14 22:40:06.832266157 +0000
++++ b/linkl.sh	2026-11-15 20:24:10.832226394 +0000
+@@ -1,7 +1,7 @@
+ #!/bin/bash
+ # linux: self-contained relocatable (only avcdec_* global) + test exe
+ set -e; cd /home/claude/stage3/s3
+-U=""; for s in version init open feed_annexb decode_sample flush reset close; do U="$U -u avcdec_$s"; done
++U=""; for s in version init open feed_annexb decode_sample flush reset close set_skip get_delay set_delay take_lowest held peek_lowest; do U="$U -u avcdec_$s"; done
+ powerpc-linux-gnu-ld -r --gc-sections $U -e avcdec_init -o all_l.o ol/*.o
+ echo "undef: $(powerpc-linux-gnu-nm -u all_l.o | awk '{print $2}' | tr '\n' ' ')"
+ powerpc-linux-gnu-objcopy -w --keep-global-symbol='avcdec_*' all_l.o lib_l.o
