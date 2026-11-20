@@ -10,8 +10,19 @@
 #ifndef H264CODEC_H_INCLUDED
 #define H264CODEC_H_INCLUDED
 
+/* v17c: the AVCDecLib build is H264 Decoder 17, version 0x00010011
+   (65553). Registration (auto-versioning against v15/16t) and Media
+   Center's decoder-level gate depend on this number: do not change it
+   without both. The h264bsd build keeps 1.0.0. -D overrides either. */
 #ifndef kH264CodecVersion
+/* Rez reads this file too (H264Codec.r) and rejects an undefined macro inside an #if
+   expression, so only #ifdef here (b22 guest build). Consequence: -DH264_BACKEND_AVCDEC=0
+   must not be passed; leave it undefined for the h264bsd build. */
+#ifdef H264_BACKEND_AVCDEC
+#define kH264CodecVersion       0x00010011  /* 17 / 17b / 17c guest build */
+#else
 #define kH264CodecVersion       0x00010000  /* 1.0.0, bump as we go (16t test build: 0x00010010) */
+#endif
 #endif
 
 /* Component identity -- MUST match between the .r resource's 'thng'

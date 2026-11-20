@@ -14,7 +14,8 @@ FFmpeg's output by checksum and matched, including seeks.
 | High 320x240, B-frames | 5.1 | 14.7 | 30.01 |
 | High 640x480, B-frames | 15.6 | 34.7 | 30.04 |
 
-No ready-made binaries are published for 17 yet; this is source only.
+Binaries: **H264 Decoder 17c** and **AVCDecLib** r2 (see `RELEASE_NOTES-17c.md`). 17c decodes
+bit-identically to 17/17b; it adds drawing-time statistics and the `v17c` log banner.
 
 ## What plays
 - Baseline, Main and High profile, 8-bit 4:2:0, progressive. CABAC, B-frames, 8x8 transform.
@@ -42,8 +43,8 @@ therefore runs a fixed delay of N pictures: sample n shows picture n-N.
   reads one later than that.
 
 ## Files
-- `codec-src/H264Codec.c`: both backends; build with `H264_BACKEND_AVCDEC 1`,
-  `kH264CodecVersion 0x00010011`. `codec-src/AVCDecAPI.h`: the library's 14 entry points.
+- `codec-src/H264Codec.c`: both backends; build with `#define H264_BACKEND_AVCDEC 1`
+  (since 17c `H264Codec.h` then sets `kH264CodecVersion 0x00010011` by itself). `codec-src/AVCDecAPI.h`: the library's 14 entry points.
 - `codec-src/AVCReorder.c/.h`: the rewriter (C89, no libc). Not yet wired into the
   published MP4Fix / H264 Stream sources.
 - `avcdeclib/`: everything needed to rebuild AVCDecLib except FFmpeg itself (see its README).
@@ -54,7 +55,7 @@ therefore runs a fixed delay of N pictures: sample n shows picture n-N.
 - `retro68-makepef/`: fixes to Retro68's MakePEF that the library build needs.
 
 ## Known issues
-- The statistics banner in the log still says "v15".
+- (Fixed in 17c: the statistics banner said "v15".)
 - FFmpeg 0.8's IDCT can read past a table on corrupt streams (found with AddressSanitizer;
   no crash seen).
 - An old 16-series test component must never be used with this library (the picture

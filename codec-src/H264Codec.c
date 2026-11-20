@@ -239,8 +239,15 @@
    and write the table to the log when the movie closes. Costs one
    NewPtr and nothing per call but a few stores. Only if the log file
    exists. */
+/* v17c: the AVCDecLib build (H264 Decoder 17) ships with the trace on,
+   exactly as the 17b guest build did; the h264bsd build keeps it off.
+   -DkH264TimingTrace=0 still overrides it. */
 #ifndef kH264TimingTrace
+#if H264_BACKEND_AVCDEC
+#define kH264TimingTrace      1
+#else
 #define kH264TimingTrace      0
+#endif
 #endif
 
 /* Experiment: 1 = also offer 16-bit RGB (after the YUV formats, before
@@ -249,6 +256,17 @@
    16-bit RGB pixmap unasked, drawing it beats drawing nothing. */
 #ifndef kOfferRGB16
 #define kOfferRGB16           0
+#endif
+
+/* v17c experiment: 0 = do NOT offer 32-bit RGB in PreDecompress (only
+   y420, 2vuy and, with kOfferRGB16, 16-bit RGB). 1 (default) = offer it
+   last, as every version before 17c did. The 32-bit writer itself is
+   always compiled in: if QuickTime hands us a 32-bit pixmap anyway (the
+   poster frame drawn straight to the screen, say), BlitPicture paints it
+   exactly as before -- it dispatches on the destination it is given,
+   not on the list we offered. */
+#ifndef kOfferRGB32
+#define kOfferRGB32           1
 #endif
 
 /* ------------------------------------------------------------------
@@ -348,6 +366,9 @@ static void DumpBytesToShare(H264GlobalsPtr glob, const char *pathC,
                                    A G3 that averages under budget but
                                    spikes over it will stutter; this is
                                    the number that shows it
+     STATS avg/max us in blit      v17c: the same, for the destination
+                                   writer alone (y420/2vuy/RGB32/RGB16),
+                                   timed only on calls after the first 8
      STATS wall ms first->last     wall time from the first picture to
                                    the last, INCLUDING any pause. Since
                                    the poster-frame fix the first picture
@@ -516,6 +537,9 @@ struct H264Globals {
     unsigned long       statTimedCalls;
     unsigned long       statDecodeMicros;
     unsigned long       statMaxMicros;      /* slowest timed call */
+    unsigned long       statBlitTimed;      /* v17c: blits timed (after the first 8 calls) */
+    unsigned long       statBlitMicros;     /* v17c: total us inside the destination writer */
+    unsigned long       statBlitMaxMicros;  /* v17c: slowest timed blit */
     unsigned long       statFirstPicLo;
     unsigned long       statLastPicLo;
     unsigned long       statRepeats;        /* calls that re-blitted the last picture */
@@ -1575,10 +1599,37 @@ static void NoteBlit(H264GlobalsPtr glob, CodecDecompressParams *params)
     glob->lastBlitRect     = params->dstRect;
 }
 
+/* v17c: time one destination write (the y420 / 2vuy / 32-bit / 16-bit
+   writer plus NoteBlit) with the same Microseconds() clock and the same
+   "after the first 8 calls" rule as "STATS avg us per call". Only while
+   this instance is logging, so a quiet playback reads no extra clock.
+   Reported at Close as "STATS avg/max us in blit (after first 8)". */
+static Boolean BlitTimeStart(H264GlobalsPtr glob, UnsignedWide *t0)
+{
+    if (glob->statBandCalls < kStatSkipCalls || !LogEnabled(glob)) return false;
+    Microseconds(t0);
+    return true;
+}
+
+static void BlitTimeEnd(H264GlobalsPtr glob, Boolean timing, const UnsignedWide *t0)
+{
+    UnsignedWide  t1;
+    unsigned long us;
+
+    if (!timing) return;
+    Microseconds(&t1);
+    us = (unsigned long)(t1.lo - t0->lo);   /* unsigned: wrap-safe */
+    glob->statBlitMicros += us;
+    if (us > glob->statBlitMaxMicros) glob->statBlitMaxMicros = us;
+    glob->statBlitTimed++;
+}
+
 static void BlitPicture(H264GlobalsPtr glob, const u8 *yuv,
                         CodecDecompressParams *params)
 {
-    OSType fmt;
+    OSType       fmt;
+    UnsignedWide bt0;
+    Boolean      timing;
 
     if (glob == NULL || !H264_HAVE_DECODER(glob) || yuv == NULL || params == NULL)
         return;
@@ -1627,25 +1678,31 @@ static void BlitPicture(H264GlobalsPtr glob, const u8 *yuv,
 #if kOfferYUVOutput
     if (fmt == kYUV420CodecType)
     {
+        timing = BlitTimeStart(glob, &bt0);
         CopyPlanarYUVToY420(glob, yuv, params);
         glob->statBlitY420++;
         NoteBlit(glob, params);
+        BlitTimeEnd(glob, timing, &bt0);
         return;
     }
     if (fmt == k422YpCbCr8CodecType)
     {
+        timing = BlitTimeStart(glob, &bt0);
         CopyPlanarYUVTo2vuy(glob, yuv, params);
         glob->statBlit2vuy++;
         NoteBlit(glob, params);
+        BlitTimeEnd(glob, timing, &bt0);
         return;
     }
 #endif
 
     if (params->dstPixMap.pixelSize == 32)
     {
+        timing = BlitTimeStart(glob, &bt0);
         CopyPlanarYUVToPixMap(glob, yuv, params);
         glob->statBlitRGB32++;
         NoteBlit(glob, params);
+        BlitTimeEnd(glob, timing, &bt0);
         return;
     }
 
@@ -1655,9 +1712,11 @@ static void BlitPicture(H264GlobalsPtr glob, const u8 *yuv,
        and is left alone. */
     if (params->dstPixMap.pixelSize == 16 && (fmt == 0 || fmt == 16))
     {
+        timing = BlitTimeStart(glob, &bt0);
         CopyPlanarYUVToRGB16(glob, yuv, params);
         glob->statBlitRGB16++;
         NoteBlit(glob, params);
+        BlitTimeEnd(glob, timing, &bt0);
         return;
     }
 
@@ -3161,7 +3220,9 @@ negotiate:
                for it: five entries. */
             list[k++] = (OSType)16;
 #endif
+#if kOfferRGB32
             list[k++] = (OSType)k32ARGBPixelFormat;
+#endif
             list[k]   = 0;                       /* terminator */
 
             p->wantedDestinationPixelTypes = glob->wantedPixelTypes;
@@ -3796,9 +3857,11 @@ static void H264AvKeep(H264GlobalsPtr glob, CodecDecompressParams *params, long 
 static ComponentResult BandDecompressWork(H264GlobalsPtr glob,
                                           CodecDecompressParams *params)
 {
+#if !H264_BACKEND_AVCDEC
     u32 annexBSize;
     u32 readBytes = 0;
     u32 decodeStatus;
+#endif
     long dstRowBytes;
     unsigned long picsBefore;
     int action = kActDecodeAndBlit;
@@ -4406,7 +4469,7 @@ static void LogPlaybackStats(H264GlobalsPtr glob)
     if (glob == NULL || glob->statPictures == 0) return;
     if (!LogEnabled(glob)) return;
 
-    LogAppend(glob, "=== H264 Decoder v15: playback statistics ===");
+    LogAppend(glob, "=== H264 Decoder v17c: playback statistics ===");
     LogNum(glob, "STATS pictures shown", (long)glob->statPictures);
     LogNum(glob, "STATS BandDecompress calls", (long)glob->statBandCalls);
     LogNum(glob, "STATS calls that repeated the last picture", (long)glob->statRepeats);
@@ -4426,6 +4489,12 @@ static void LogPlaybackStats(H264GlobalsPtr glob)
         LogNum(glob, "STATS avg us per call (after first 8)",
                (long)(glob->statDecodeMicros / glob->statTimedCalls));
         LogNum(glob, "STATS max us per call (after first 8)", (long)glob->statMaxMicros);
+    }
+    if (glob->statBlitTimed > 0)
+    {
+        LogNum(glob, "STATS avg us in blit (after first 8)",
+               (long)(glob->statBlitMicros / glob->statBlitTimed));
+        LogNum(glob, "STATS max us in blit (after first 8)", (long)glob->statBlitMaxMicros);
     }
 
     wallMicros = glob->statLastPicLo - glob->statFirstPicLo;   /* unsigned: wrap-safe */

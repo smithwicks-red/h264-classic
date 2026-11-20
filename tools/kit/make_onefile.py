@@ -7,7 +7,7 @@ tested at boot in the VM):
 
   'thng' 256  extended template, registration flags 9
               (componentHasMultiplePlatforms | componentDoAutoVersion),
-              version 0x00010000, one platform entry:
+              version 0x00010000 (env H264_THNG_VERSION overrides, e.g. 0x00010010 for 16t), one platform entry:
               flags 0, code 'cdec' 256, platform 2 (PowerPC)
   'STR ' 256  name, 'STR ' 257 info
   'cdec' 256  the PEF container with its loader header's main symbol set
@@ -67,7 +67,7 @@ def main(pefpath, outdir, name='H264 Decoder',
             b'cdec' + struct.pack('>h', 256) +
             b'STR ' + struct.pack('>h', 256) + b'STR ' + struct.pack('>h', 257) +
             b'\0\0\0\0' + struct.pack('>h', 0) +
-            struct.pack('>IihI', 0x00010000, 9, 0, 1) +
+            struct.pack('>IihI', int(os.environ.get('H264_THNG_VERSION', '0x00010000'), 16), 9, 0, 1) +
             struct.pack('>I', 0) + b'cdec' + struct.pack('>hh', 256, 2))
     assert len(thng) == 70
     os.makedirs(outdir, exist_ok=True)
