@@ -10,14 +10,48 @@ C decoder, wrapped as a QuickTime image decompressor component and built with
 CodeWarrior Pro 8.3 under Mac OS 9. As far as we know nothing else like it
 exists for Mac OS 9.
 
-## New: decoder 17 (Main/High profile and B-frames, source only)
+## New: decoder 17d (Main/High profile and B-frames)
 
-The source now contains **decoder 17**, which adds FFmpeg 0.8.15's H.264 decoder as a
-second backend in a separate LGPL shared library (AVCDecLib). It plays Main and High
-profile video with B-frames, bit-exactly, in QuickTime Player 6 on a Mac mini G4: about
-15.6 ms per frame at 640x480 and 5 ms at 320x240, at full frame rate. It also fixes the
-"seeking straight onto a key frame" issue listed below for that backend. There are no
-binaries for it yet. Details: [`docs/DECODER-17.md`](docs/DECODER-17.md).
+**Decoder 17d** is the first binary release that plays **Main and High profile** H.264,
+with B-frames, CABAC and the 8x8 transform. It comes as two files that both go in
+System Folder:Extensions:
+
+| File | What it is | Licence |
+|---|---|---|
+| **H264 Decoder 17d** | The QuickTime 6 decompressor component, version 0x00010011 (65553). | MIT (no h264bsd code; built with h264bsd's `basetype.h` typedefs, notice kept) |
+| **AVCDecLib** | A separate CFM shared library ('shlb'): FFmpeg 0.8.15's H.264 decoder, cut down to H.264 only, with AltiVec code chosen at run time. Version 0x00080F02 (r2). | LGPL 2.1 or later |
+
+- Plays Baseline, Main and High profile, 8-bit 4:2:0, in QuickTime 6 on Mac OS 9.2.2.
+- **640x480 needs a G4 with AltiVec.** On a Mac mini G4 (1.25 GHz) decoder 17 played
+  High 640x480 with B-frames at about 15.6 ms per frame, 320x240 at about 5 ms.
+  A G3 is untested (a PowerBook G3 test is pending).
+- **Memory:** QuickTime Player's standard partition is too small for 640x480 Main/High
+  with B-frames; when it runs out it warns "running low on memory" and can freeze the
+  whole Mac. Give QuickTime Player about 32 MB (Get Info > Memory: preferred 32768 K,
+  minimum 16384 K; 24576 K on a Mac short of RAM).
+- B-frames on QuickTime 6, by design: plain files lose their last N pictures (N = the
+  stream's reorder delay, usually 1 or 2), and files with negative `ctts` offsets play
+  N frames late. Media Center (a later release) rewrites such files so that neither
+  happens. Details: [`docs/DECODER-17.md`](docs/DECODER-17.md).
+- New in 17d over 17c: the AVCDecLib build references no h264bsd code at all (every
+  h264bsd call, member and include is behind `#if !H264_BACKEND_AVCDEC`), so the
+  CodeWarrior project builds with all `decoder-src/*.c` removed; the log banner says
+  `v17d`. Decoding is bit-identical to 17c.
+- New in 17c over 17/17b: two new log lines, `STATS avg/max us in blit`, time the drawing
+  apart from the decoding; `H264Codec.h` builds under Rez (`#ifdef H264_BACKEND_AVCDEC`);
+  a compile-time switch `kOfferRGB32` (default on, as before).
+- Release notes: [`docs/RELEASE_NOTES-17d.md`](docs/RELEASE_NOTES-17d.md)
+  (17c: [`docs/RELEASE_NOTES-17c.md`](docs/RELEASE_NOTES-17c.md), never released as a binary).
+- **Classic Media Center**, the Internet Archive browser that streams films (https
+  included, through an in-app proxy) into QuickTime Player with this decoder, now lives in
+  its own repository: [smithwicks-red/classic-media-center](https://github.com/smithwicks-red/classic-media-center).
+
+**AVCDecLib's source.** `avcdeclib/` holds everything we wrote for the library (API,
+shims, libc, scripts, configuration and our patches to FFmpeg). The release assets also
+carry the complete corresponding source as one tarball (`b21a-avcdeclib-r2-src.tgz`:
+the patched FFmpeg 0.8.15 tree, the five libgcc objects, MakePEF), with the LGPL text,
+rebuild notes and how to swap in your own build. The FFmpeg tree itself (36 MB
+unpacked) is not kept in this repository.
 
 The rest of this page describes the released v15 kit.
 
@@ -118,6 +152,23 @@ the QuickTime 6 SDK for Mac OS from a classic Mac software archive.
    (it adds the `'thng'` resource and points the code fragment at the
    dispatcher; see its header).
 
+### Decoder 17d (`H264 Decoder 17d`, AVCDecLib backend)
+
+Same project as above, with the backend switched to AVCDecLib:
+
+1. Put `#define H264_BACKEND_AVCDEC 1` before anything else in `H264Codec.c` (the 17c/17d
+   release builds did exactly this; a prefix file works too). Leave the macro
+   **undefined** for the h264bsd build: `H264Codec.h` is also read by Rez, which only
+   understands `#ifdef` there, so `-DH264_BACKEND_AVCDEC=0` would select the wrong
+   version number. With the macro defined, `kH264CodecVersion` is 0x00010011 and the
+   timing trace is on.
+2. Remove `decoder-src/*.c` from the project (17d references no h264bsd function; 17c
+   still needed them). Keep `decoder-src/` on the access path for `basetype.h`, and
+   `AVCDecAPI.h` too.
+3. Make, then wrap the output with the version in the `'thng'` resource:
+   `H264_THNG_VERSION=0x00010011 python3 tools/kit/make_onefile.py "H264 Decoder" OUTDIR "H264 Decoder 17d"`
+4. AVCDecLib is built separately with Retro68: see [`avcdeclib/README.md`](avcdeclib/README.md).
+
 ### mp4fixer
 
 "C Console Classic" stationery (Mac OS PPC, not Carbon), remove
@@ -168,6 +219,13 @@ It contains nobody's footage and is dedicated to the public domain (CC0).
 
 - **The port's own code** (`codec-src/`, `mediacenter/`, `tools/`, `docs/`):
   MIT, see [`LICENSE`](LICENSE).
+- **AVCDecLib** (the shared library built from `avcdeclib/` and FFmpeg 0.8.15): LGPL
+  2.1 or later, as FFmpeg 0.8.15 configured without its GPL parts. The files in
+  `avcdeclib/` that we wrote are MIT. The library contains FFmpeg's `jrevdct.c`, so:
+  this software is based in part on the work of the Independent JPEG Group. It also
+  contains five libgcc helpers, covered by the GCC Runtime Library Exception. It is a
+  separate file that the component loads by name, so users can replace it with their
+  own build. See the 17d release's `LICENCE AUDIT.md`.
 - **h264bsd** (`decoder-src/`): Apache License 2.0 for the code derived from
   the Android Open Source Project, and MIT for h264bsd's own wrapper code
   (Copyright (c) 2013-2022 Sam Leitch). See
