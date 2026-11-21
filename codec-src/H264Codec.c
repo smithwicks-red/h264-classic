@@ -122,8 +122,20 @@
 #include <Movies.h>
 #endif /* !H264_HOST_BUILD */
 
+/* v17d: the AVCDecLib build (H264_BACKEND_AVCDEC 1) references no h264bsd
+   header, type or function, so the old decoder is not linked in. The
+   default for the switch has to be settled before the first test of it. */
+#ifndef H264_BACKEND_AVCDEC
+#define H264_BACKEND_AVCDEC 0
+#endif
+#if !H264_BACKEND_AVCDEC
 #include "h264bsd_decoder.h"
 #include "h264bsd_util.h"
+#else
+#include "basetype.h"   /* u8/u32 etc.: types only, no h264bsd function */
+void *H264MemAlloc(unsigned long size);
+void  H264MemFree(void *ptr);
+#endif
 #include "avcC_parse.h"
 #include "H264Codec.h"
 
@@ -132,9 +144,6 @@
    first use with GetSharedLibrary and called through a table of 8 entry
    points. Everything else (dispatch, pixel writers, lateness policy,
    logging, error survival) is shared. */
-#ifndef H264_BACKEND_AVCDEC
-#define H264_BACKEND_AVCDEC 0
-#endif
 #if H264_BACKEND_AVCDEC
 #include "AVCDecAPI.h"
 #ifndef H264_HOST_BUILD
@@ -438,8 +447,10 @@ struct H264Globals {
     ComponentInstance   self;
     ComponentInstance   target;        /* set by the Target selector */
 
+#if !H264_BACKEND_AVCDEC
     storage_t          *h264;          /* h264bsd decoder instance */
     int                 h264Inited;    /* have we called h264bsdInit yet? */
+#endif
 
     u32                 lengthSize;    /* NAL length-prefix width from avcC: 1/2/4 */
 
@@ -2809,12 +2820,14 @@ pascal ComponentResult H264CodecClose(H264GlobalsPtr glob, ComponentInstance sel
 #endif
         glob->avLoaded = false;
 #endif
+#if !H264_BACKEND_AVCDEC
         if (glob->h264 != NULL)
         {
             if (glob->h264Inited) h264bsdShutdown(glob->h264);
             h264bsdFree(glob->h264);
             glob->h264 = NULL;
         }
+#endif
         if (glob->annexBScratch != NULL)
         {
             H264MemFree(glob->annexBScratch);
@@ -4469,7 +4482,7 @@ static void LogPlaybackStats(H264GlobalsPtr glob)
     if (glob == NULL || glob->statPictures == 0) return;
     if (!LogEnabled(glob)) return;
 
-    LogAppend(glob, "=== H264 Decoder v17c: playback statistics ===");
+    LogAppend(glob, "=== H264 Decoder v17d: playback statistics ===");
     LogNum(glob, "STATS pictures shown", (long)glob->statPictures);
     LogNum(glob, "STATS BandDecompress calls", (long)glob->statBandCalls);
     LogNum(glob, "STATS calls that repeated the last picture", (long)glob->statRepeats);
