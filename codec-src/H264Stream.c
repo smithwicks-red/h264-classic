@@ -128,7 +128,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
-#include "mc_core.h"      /* mc_avc_profile / mc_avc_verdict */
+#include "AVCProfile.h"   /* mc_avc_profile / mc_avc_verdict */
 
 #ifndef H264STREAM_HOSTTEST
 #include <Types.h>
@@ -180,8 +180,9 @@
 #define kAACSamplesPerPacket   1024
 #define kVariableCompression   0xFFFEU
 
-/* An app that #includes this file (MediaCenter.c, with
-   H264STREAM_LIBRARY defined) may set its own names first. */
+/* An app that #includes this file (Classic Media Center's
+   MediaCenter.c, with H264STREAM_LIBRARY defined) may set its own
+   names first. */
 #ifndef kUserAgent
 #define kUserAgent  "H264Stream/1.2 (Macintosh; PPC Mac OS 9; QuickTime 6)"
 #endif

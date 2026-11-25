@@ -3,7 +3,8 @@
     against a fake HTTP server, and write the reference movie it
     builds to a file, for byte comparison with mkref.py.
 
-    Build:  gcc -std=c89 -Wall -o h264stream_hosttest h264stream_hosttest.c
+    Build:  gcc -std=c89 -Wall -I../codec-src -o h264stream_hosttest \
+                h264stream_hosttest.c ../codec-src/AVCProfile.c
     Usage:  ./h264stream_hosttest FILE.mp4 MODE URL OUT.mov
       MODE: plain     serve FILE at any path
             redirect  /r/... answers 302 -> http://media.example:8080/<rest>

@@ -21,8 +21,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 -----------------------------------------------------------------------------
-This licence covers the port's own code (codec-src/, mediacenter/, tools/,
-docs/). The decoder in decoder-src/ is h264bsd and keeps its own licence:
+This licence covers the port's own code (codec-src/, tools/, docs/). The
+decoder in decoder-src/ is h264bsd and keeps its own licence:
 Apache License 2.0 for the code derived from the Android Open Source Project,
 MIT (Copyright (c) 2013-2022 Sam Leitch) for h264bsd's own additions. See
 decoder-src/H264BSD-LICENSE.md and decoder-src/LICENSE-Apache-2.0.txt.
