@@ -31,8 +31,8 @@ System Folder:Extensions:
   minimum 16384 K; 24576 K on a Mac short of RAM).
 - B-frames on QuickTime 6, by design: plain files lose their last N pictures (N = the
   stream's reorder delay, usually 1 or 2), and files with negative `ctts` offsets play
-  N frames late. Media Center (a later release) rewrites such files so that neither
-  happens. Details: [`docs/DECODER-17.md`](docs/DECODER-17.md).
+  N frames late. [Classic Media Center](https://github.com/smithwicks-red/classic-media-center)
+  rewrites such files so that neither happens. Details: [`docs/DECODER-17.md`](docs/DECODER-17.md).
 - New in 17d over 17c: the AVCDecLib build references no h264bsd code at all (every
   h264bsd call, member and include is behind `#if !H264_BACKEND_AVCDEC`), so the
   CodeWarrior project builds with all `decoder-src/*.c` removed; the log banner says
@@ -178,12 +178,12 @@ file's header.
 ### H264 Stream 1.2
 
 "C Console Classic" stationery (Mac OS PPC, not Carbon). Remove
-HelloWorld.c and add `codec-src/H264Stream.c` and `mediacenter/mc_core.c`
-(1.2 uses its H.264 profile check), plus `OpenTransportLib`,
+HelloWorld.c and add `codec-src/H264Stream.c` and `codec-src/AVCProfile.c`
+(the H.264 profile check 1.2 runs before it plays a file), plus `OpenTransportLib`,
 `OpenTptInternetLib` (stub libraries), `OpenTransportAppPPC.o` and
-`OpenTptInetPPC.o` (static glue). Access paths: `codec-src`, `mediacenter`.
-No prefix file; Require Prototypes off. `mc_core.c` and its tests also
-build on any Unix: `sh mediacenter/run_tests.sh`.
+`OpenTptInetPPC.o` (static glue). Access path: `codec-src`.
+No prefix file; Require Prototypes off. `AVCProfile.c` and its tests also
+build on any Unix: `sh tools/avcprofile/run_tests.sh`.
 
 ### Line endings
 
@@ -200,6 +200,8 @@ Python 3 and C tools that run on a modern machine:
   (`run_all.sh MOVIE`).
 - `tools/kit/` makes the `.hqx` files and the HFS disk image (`make_kit.py`
   needs `pip install machfs`).
+- `tools/h264stream_hosttest.c` runs the real `H264Stream.c` against a fake
+  web server; `tools/avcprofile/` tests its profile check.
 - `tools/qtify.py` does on a modern machine what mp4fixer does on the Mac.
 - `tools/make_test_clip.sh` regenerates the kit's test movie (needs
   FFmpeg with libx264).
@@ -217,7 +219,7 @@ It contains nobody's footage and is dedicated to the public domain (CC0).
 
 ## Licences
 
-- **The port's own code** (`codec-src/`, `mediacenter/`, `tools/`, `docs/`):
+- **The port's own code** (`codec-src/`, `tools/`, `docs/`):
   MIT, see [`LICENSE`](LICENSE).
 - **AVCDecLib** (the shared library built from `avcdeclib/` and FFmpeg 0.8.15): LGPL
   2.1 or later, as FFmpeg 0.8.15 configured without its GPL parts. The files in
