@@ -77,12 +77,21 @@ the Mac side. Decode the `.hqx` files on the Mac with StuffIt Expander.
 
 ## Limits
 
-- **Baseline profile only.** h264bsd decodes the H.264 Baseline profile: no
-  CABAC, no B-frames, no 8x8 transform. Main and High profile video (almost
-  everything from modern phones, cameras and most of today's web) will not
-  play. The decoder recognises such files and declines them. Baseline
-  sources that do work include the Internet Archive's "512Kb MPEG4"
-  derivatives, YouTube's old 360p MP4 (format 18) and many older phones.
+- **Profiles depend on which decoder you install.**
+  - **Decoder 17d + AVCDecLib** plays Baseline, Main and High (8-bit 4:2:0,
+    progressive). In 17d **every** film, Baseline included, is decoded by
+    AVCDecLib: h264bsd is not in the 17d component at all (it is chosen at
+    build time, `H264_BACKEND_AVCDEC`). Without AVCDecLib installed, 17d
+    shows a black picture with sound and logs "AVCDecLib not found".
+  - **The h264bsd decoder** (`H264 Decoder`, v15 and earlier) is Baseline
+    only: no CABAC, no B-frames, no 8x8 transform. It recognises Main/High
+    files and declines them. Baseline sources include the Internet Archive's
+    "512Kb MPEG4" derivatives, YouTube's old 360p MP4 (format 18) and many
+    older phones.
+  - **H264 Stream 1.2** still checks for Baseline and refuses Main/High
+    films, even when 17d is installed. Use
+    [Classic Media Center](https://github.com/smithwicks-red/classic-media-center)
+    for Main/High films.
 - **Plain HTTP only** (H264 Stream). QuickTime 6 has no TLS, so it cannot
   fetch `https://` media. H264 Stream fetches only the movie's index over
   `http://` and lets QuickTime stream the rest; if a server redirects to
